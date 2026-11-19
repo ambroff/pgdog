@@ -1,0 +1,51 @@
+#cloud-config
+# Node image for the PgDog Jepsen suite. nodes.sh substitutes @SSH_PUBKEY@.
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: root
+    # cloud-init locks the password by default, and sshd refuses locked
+    # accounts even for key auth. Jepsen's docs use root/root; password SSH
+    # stays disabled (ssh_pwauth: false), so this only works on the console.
+    lock_passwd: false
+    ssh_authorized_keys:
+      - "@SSH_PUBKEY@"
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: root
+      type: text
+# The Incus Debian cloud image ships a near-empty sshd_config (no Include of
+# sshd_config.d, no Subsystem line), and Jepsen's scp needs SFTP.
+runcmd:
+  - grep -q '^Subsystem' /etc/ssh/sshd_config || echo 'Subsystem sftp /usr/lib/openssh/sftp-server' >> /etc/ssh/sshd_config
+  - systemctl restart ssh
+  # Incus gives a restored snapshot a new cloud-init instance-id, which would
+  # re-run cloud-init (re-locking root, reinstalling packages) on every
+  # `nodes.sh reset`. Provision once, then switch cloud-init off.
+  - touch /etc/cloud/cloud-init.disabled
+package_update: true
+packages:
+  # Jepsen basics
+  - openssh-server
+  # Jepsen uploads/downloads with scp, which uses the SFTP subsystem.
+  - openssh-sftp-server
+  - sudo
+  - curl
+  - ca-certificates
+  - gnupg
+  - iptables
+  - iproute2
+  - psmisc
+  - rsyslog
+  # jepsen.nemesis.time compiles its clock helper on the node
+  - build-essential
+  # jepsen.lazyfs builds LazyFS from source
+  - git
+  - cmake
+  - g++
+  - fuse3
+  - libfuse3-dev
+  # NTP that the clock nemesis can stop
+  - chrony
