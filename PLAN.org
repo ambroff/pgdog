@@ -195,32 +195,52 @@ believes cross-shard autocommit writes are atomic by default. They aren't.
 
 * Test environment
 
-** Decision: VMs, control node on the host
-Use libvirt/virt-manager VMs, not Docker. Docker containers share the host
-kernel's clock, so Jepsen's clock nemesis would skew every "node" (and the
-host) together. That makes C8/H7 untestable. LazyFS needs FUSE, which is
-also awkward in containers. VMs give each node its own clock, kernel, page
-cache and fsync behaviour.
+** Decision: Incus VMs, control node on the host
+Use Incus VMs (=incus launch ... --vm=). This is the path Jepsen's own setup
+guide documents for Debian 13 (=doc/lxc.md=, "Debian 13/trixie - Incus" and
+"Real VMs w/Real Clocks").
 
-Setup:
-- *Control node = the host* (Debian 13). Install a JDK (21) and Leiningen.
-  Build PgDog on the host with =cargo build --release=. The VMs run the same
-  Debian release, so glibc matches and the binary can be uploaded as is.
-- *Base VM:* Debian stable (13), minimal, 2 vCPU / 4 GB / 20 GB disk.
-  - Root SSH with the host's key; =sudo=, =iptables=, =iproute2=.
-  - =build-essential= (Jepsen compiles its clock helper on the nodes);
-    =fuse3=, =libfuse3-dev=, =cmake=, =g++=, =git= (LazyFS).
-  - =chrony= installed but stoppable (the clock nemesis stops NTP).
-  - Snapshot the VM once configured.
-- *Clone* it 5× with =virt-clone= into =n1=…=n5=. Give each a fresh
-  machine-id and SSH host keys, plus a static DHCP reservation on the libvirt
-  default network. Add =n1=…=n5= to =/etc/hosts= on the host and on every VM.
-- Postgres from the PGDG apt repo, installed by =db.clj= rather than baked in,
-  so the Postgres version can vary per run.
-- Keep a libvirt snapshot of the clean cluster. If a run leaves a node
-  wedged (e.g. a clock left at a strange value), revert instead of debugging.
-- Jepsen's Docker env is still handy for fast iteration on client and checker
-  code in M0. Results that count come from the VMs.
+Why VMs and not containers: containers (Docker, LXC, Incus without =--vm=)
+share the host kernel's clock, so Jepsen's clock nemesis would skew every
+"node" (and the host) together. That makes C8/H7 untestable. LazyFS needs
+FUSE, which is also awkward in containers. VMs give each node its own clock,
+kernel, page cache and fsync behaviour.
+
+Host (control node) setup, done once:
+- =sudo apt install incus=, then =sudo adduser $USER incus-admin= and log in
+  again; =incus admin init --minimal=.
+- *Docker coexistence:* Docker is installed and active on this host. It sets
+  the iptables =FORWARD= policy to =DROP=, which breaks the =incusbr0= bridge
+  (Jepsen's docs warn about this too). Fix with
+  =iptables -I DOCKER-USER -i incusbr0 -j ACCEPT= and
+  =iptables -I DOCKER-USER -o incusbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT=,
+  persisted with a small systemd unit or =iptables-persistent=. =nodes.sh up=
+  checks for these rules and fails loudly if they're missing.
+- Install a JDK (21) and Leiningen. Java is already present; =lein= is not.
+- Build PgDog on the host with =cargo build --release=. The nodes run the
+  same Debian release, so glibc matches and the binary can be uploaded as is.
+
+Nodes are created by a checked-in script, =integration/jepsen/nodes.sh=:
+- =nodes.sh up [N=5]=: for each =n$i=, run
+  =incus launch images:debian/13/cloud n$i --vm -c limits.cpu=2 -c limits.memory=4GiB -d root,size=20GiB=
+  with a cloud-init =user-data= that:
+  - Enables root SSH with the host's public key.
+  - Installs =openssh-server sudo iptables iproute2 build-essential=. The
+    nodes need a compiler because Jepsen builds its clock helper there.
+  - Installs =fuse3 libfuse3-dev cmake g++ git= (LazyFS).
+  - Installs =chrony=, which the clock nemesis can stop.
+  Then it waits for cloud-init, writes =n1=…=n5= into =/etc/hosts= on the host
+  and on every node, refreshes =~/.ssh/known_hosts= with =ssh-keyscan=, and
+  takes a =clean= snapshot of each node.
+- =nodes.sh reset=: =incus restore n$i clean= on every node. Use it whenever
+  a run leaves a node wedged (e.g. a clock at a strange value), instead of
+  debugging the node.
+- =nodes.sh down=: delete the nodes.
+- =nodes.sh up --containers=: the same nodes without =--vm=, for fast
+  iteration on client and checker code. Results that count come from VMs.
+
+Postgres comes from the PGDG apt repo and is installed by =db.clj=, not baked
+into the image, so the Postgres version can vary per run.
 
 ** Topology
 Jepsen needs a control node plus N DB nodes it can SSH to as root. PgDog and
@@ -248,6 +268,8 @@ Follow the existing integration convention (each suite in
 #+begin_example
 integration/jepsen/
   run.sh                 # builds pgdog, brings up nodes, runs a smoke matrix
+  nodes.sh               # Incus VM lifecycle: up / reset / down
+  cloud-init.yaml        # node user-data (root SSH, packages)
   project.clj            # Leiningen; jepsen, elle, next.jdbc, pgjdbc
   resources/pgdog.toml.selmer, users.toml.selmer
   src/pgdog/jepsen/
@@ -336,8 +358,10 @@ these windows.
 * Milestones
 
 ** TODO M0: Harness bring-up
-- [ ] Base Debian VM built and snapshotted; n1–n5 cloned; host can SSH to all
-      as root; =/etc/hosts= consistent
+- [ ] Incus installed; Docker =DOCKER-USER= rules in place for =incusbr0=
+- [ ] =nodes.sh up= creates n1–n5 VMs; the host can SSH to all of them as
+      root; =/etc/hosts= is consistent; =clean= snapshots exist
+- [ ] =nodes.sh reset= restores a deliberately broken node
 - [ ] JDK + Leiningen on the host; Jepsen's =lein run test --nodes n1,...=
       reaches every node
 - [ ] =db.clj= installs Postgres on n3–n5, uploads and starts PgDog on n1–n2
