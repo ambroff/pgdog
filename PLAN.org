@@ -1,0 +1,442 @@
+#+TITLE: Validating PgDog's consistency claims with Jepsen
+#+STARTUP: overview
+#+TODO: TODO IN-PROGRESS BLOCKED | DONE CANCELLED
+
+* Goal
+
+Use [[https://github.com/jepsen-io/jepsen][Jepsen]] (with Elle for transactional histories) to test, under faults,
+the safety properties PgDog claims or implies. For each claim, record one of
+three outcomes:
+
+1. *Holds.* No anomalies found under the faults we injected.
+2. *Doc gap.* PgDog behaves as designed, but the docs promise more (or are
+   ambiguous). Fix the docs.
+3. *Bug.* PgDog violates a property it does claim. Record it in the private
+   findings report (see [[*Reporting and triage][Reporting and triage]]) with
+   the Jepsen test as the reproducer. Regression tests are proposed to the
+   PgDog devs as part of the report, not opened as public issues/PRs.
+
+Out of scope: performance, liveness (except where a liveness failure is
+really a safety failure, e.g. orphaned prepared transactions holding locks),
+and auth.
+
+* Claims inventory
+
+What PgDog says (README.md, docs/, config docs) and what we will check.
+
+| # | Claim / implied guarantee                                                                                                                        | Source                                                    | How we test it                                                         |
+|---+--------------------------------------------------------------------------------------------------------------------------------------------------+-----------------------------------------------------------+------------------------------------------------------------------------|
+| C1 | Transparent proxy: a client connected to PgDog gets the same isolation guarantees as one connected to Postgres                                  | README "Transaction pooling", CLAUDE.md                   | Elle list-append through PgDog vs. directly against Postgres (control) |
+| C2 | Session state (=SET=, startup params) follows the client across pooled server connections                                                         | README "Transaction pooling"                              | Session-isolation-leak workload                                        |
+| C3 | Direct-to-shard transactions keep Postgres' per-shard isolation                                                                                  | README "Direct-to-shard queries"                          | Elle list-append, keys pinned to one shard per txn                     |
+| C4 | With =two_phase_commit=, cross-shard writes are atomic                                                                                           | README "Consistency (two-phase commit)"                   | Cross-shard append + final-state atomicity checker                     |
+| C5 | If the client disconnects or Postgres/PgDog crashes, phase-1 txns are rolled back and phase-2 txns committed (durable 2PC WAL)                    | README; =two_pc/wal/README.md=                            | Kill/pause nemeses + LazyFS on the WAL dir + orphan checker            |
+| C6 | Multi-tuple =INSERT= split across shards (=split_inserts = "rewrite"=) is atomic when 2PC is on                                                  | README; =pgdog-config/src/core.rs:586= warning            | Cross-shard multi-tuple insert workload                                |
+| C7 | Shard-key =UPDATE= (SELECT + INSERT + DELETE) moves a row without loss or duplication                                                            | README "Shard key updates"                                | Shard-key-move workload                                                |
+| C8 | =pgdog.unique_id()= returns globally unique =BIGINT=s (given unique =NODE_ID= and "reasonably accurate" clocks)                                    | README; =pgdog/src/unique_id.rs= header                   | Jepsen unique-ids checker + clock and restart nemeses                  |
+| C9 | Writes go to the primary; transactions go to the primary unless =BEGIN READ ONLY=; replicas lagging beyond =ban_replica_lag= are taken out of rotation | README "Load balancer"; =general.rs= =ban_replica_lag*=    | Read/write split workload + bounded-staleness checker                  |
+| C10 | With =role = "auto"=, PgDog follows a promoted replica and redirects writes                                                                      | README "Failover"                                         | Promotion nemesis + Elle; split-brain probe                            |
+| C11 | Resharding cutover (=RESHARD= / =MAINTENANCE ON=, =RELOAD=, =MAINTENANCE OFF=) loses no committed writes; "a drain never skips committed changes" | README "Re-sharding"; =docs/RESHARDING.md= "Cutover phases" | Elle list-append running across a live cutover                         |
+| C12 | If a txn errors and the client still sends =COMMIT=, PgDog rolls back on every shard                                                              | =end_transaction.rs= =end_connected=                      | Error-injection op inside cross-shard txns                             |
+
+The 2PC docs ([[https://docs.pgdog.dev/features/sharding/2pc/]]) word the
+atomicity claim cautiously: cross-shard txns "have a very high chance of being
+atomic", and 2PC "provides an /eventual consistency/ guarantee only". Crash
+recovery ([[https://docs.pgdog.dev/features/sharding/2pc/crash-recovery/]]) is
+marked "new and experimental" and "requires PgDog to run on a machine with a
+durable storage medium". So for C4/C5 the bar is: all-or-nothing *once
+recovery has finished*, given a durable WAL disk. Part of the job is to put a
+number on "very high chance".
+
+Claims PgDog does *not* make, which we must not file as bugs (record them as
+"expected anomalies" in the results):
+
+- *No global snapshot across shards.* A cross-shard read can see one shard
+  before a 2PC commit and another shard after it. Expect Elle to report
+  read-skew / G-single style anomalies on cross-shard reads even with 2PC on.
+  The docs say this explicitly: "other clients will be able to see partial
+  updates to the database cluster".
+- *No strict serializability across shards* (no global commit order).
+- *Async replicas are stale.* Reads routed to replicas are not read-your-writes
+  unless the docs say so for a given mode.
+- *PgDog does not fence an old primary.* It "doesn't replace tools like Patroni".
+
+* Hypotheses from reading the code (unverified)
+
+These are the leads to go after first. Each one needs a Jepsen run that
+confirms or rules it out.
+
+** H1: 2PC crash recovery orphans prepared transactions when =NODE_ID= is unset
+- The gid is =__pgdog_2pc_[<deployment_id>_]<instance_id>_<tid>=
+  (=two_pc/transaction.rs=).
+- =instance_id()= is =NODE_ID= if set, otherwise 8 random hex chars generated
+  per process (=pgdog/src/util.rs:50=).
+- The WAL identity record stores only the numeric =tid= plus user/db
+  (=two_pc/wal/record/identity.rs=), not the full gid.
+- After a restart without =NODE_ID=, recovery rebuilds a gid with the /new/
+  instance id. =cleanup_phase= calls =two_pc(.., ignore_missing = true)=
+  (=two_pc/manager.rs=), so the =COMMIT/ROLLBACK PREPARED= for a gid that
+  doesn't exist may "succeed" silently. The real prepared txn then stays in
+  =pg_prepared_xacts= holding locks, and phase-2 txns are never committed
+  (a lost acknowledged write, if the client was acked).
+- The existing crash test (=integration/two_pc/crash_recovery.py:112=) sets
+  =NODE_ID=, so it wouldn't catch this.
+- The docs never tie =NODE_ID= to 2PC. It is documented only on the unique-IDs
+  page, as needed for unique ID generation. A user who follows the 2PC and
+  crash-recovery docs would not set it. If this is confirmed, it is a bug, not
+  a misconfiguration. Possible fixes: persist the full gid (or the instance id)
+  in the WAL; refuse to start with 2PC on and =NODE_ID= unset; or have
+  recovery also scan =pg_prepared_xacts= for this deployment's prefix.
+- Test: kill nemesis on PgDog with and without =NODE_ID=; orphan checker.
+
+** H2: The 2PC WAL is lost along with the PgDog node
+- Each PgDog instance has its own WAL. Nothing else scans
+  =pg_prepared_xacts= for another instance's =__pgdog_2pc_*= gids (the only
+  other reader is =replication_slot.rs=, which only counts them).
+- If a node is replaced (k8s pod rescheduled, WAL on an ephemeral volume),
+  its in-doubt txns are orphaned for good.
+- Test: kill a PgDog node and bring it back with an empty WAL dir. Also kill
+  one node permanently while a second node keeps serving traffic.
+
+** H3: WAL durability depends on the fsync settings
+- =two_phase_commit_wal_fsync_interval= defaults to 0 (flush and fsync on
+  each write signal). A non-zero value fsyncs on a timer. Check whether
+  =wait_flush()= then returns before the fsync, in which case a phase-2 record
+  could be acked to the protocol and lost on a power failure.
+- Test: LazyFS under the WAL dir with "lose unfsynced writes" plus a PgDog
+  kill, at fsync interval 0 and at 100 ms.
+
+** H4: Error on =COMMIT= does not mean "not committed"
+- =end_two_pc= returns an error if phase 2 fails partway, e.g. the
+  connection to one shard drops after another shard already ran
+  =COMMIT PREPARED=. The manager and recovery then finish the commit.
+- Postgres clients usually read an error on =COMMIT= (other than a lost
+  connection) as a definite abort. If PgDog returns an ordinary
+  =ErrorResponse= here, an "aborted" txn becomes visible. Elle reports that as
+  G1a (aborted read).
+- Test: the Jepsen client first maps COMMIT errors to =:fail= (definite) by
+  SQLSTATE, to surface this. Classify the result afterwards: bug or doc gap.
+
+** H5: When 2PC actually kicks in
+- 2PC runs only if =two_pc_enabled() && route.is_write() && !rollback &&
+  transaction.write() && connected_servers() > 1= (=end_transaction.rs:75=).
+- Edge cases to probe:
+  - Cross-shard writes in autocommit: multi-tuple insert, cross-shard
+    =UPDATE=/=DELETE= without =BEGIN=. These depend on
+    =two_phase_commit_auto=.
+  - A txn whose =Transaction= is classified read-only but contains a write
+    (=BEGIN READ ONLY= is rejected by PG, but what about functions?
+    =SELECT ... FOR UPDATE=? data-modifying CTEs?).
+  - Extended protocol vs. simple protocol =COMMIT=.
+- Test: run every cross-shard workload under both protocols, with
+  =two_phase_commit_auto= on and off.
+
+** H6: Concurrent shard-key updates can duplicate rows
+- The rewrite runs SELECT, INSERT (new shard), DELETE (old shard). I found
+  no =FOR UPDATE= / locking read on this path (to be confirmed). Two
+  concurrent moves of the same row could both read it and both insert,
+  which yields duplicates. Separately, without 2PC a crash between the
+  INSERT and the DELETE leaves a duplicate.
+- Test: shard-key-move workload with high contention on few rows.
+
+** H7: =unique_id= can repeat after a clock step backwards across a restart
+- The last timestamp and sequence live only in memory. Within one process,
+  =wait_until= handles a clock that goes backwards. After a restart, if the
+  clock is behind the last emitted timestamp, IDs can repeat.
+- Jepsen's clock nemesis (bump/strobe) plus kill/restart should find this.
+  The code comment asks for "reasonably accurate" clocks, but the user docs
+  ([[https://docs.pgdog.dev/features/sharding/unique-ids/]]) state no clock
+  requirement at all. At minimum this is a doc gap. Measure the bound (how
+  far back the clock can step without causing duplicates) so the report can
+  propose wording.
+- Small extra doc gap: the unique-IDs page gives "e.g., =hostname=" as the node
+  identifier, but =NODE_ID= has to end in =-<number>=.
+
+** H8: Split-brain routing with =role = "auto"=
+- If the old primary is partitioned from its replicas but not from PgDog,
+  and a replica is promoted, two hosts report =pg_is_in_recovery() = false=.
+  Which one gets writes? Does PgDog ever write to both, or flip-flop between
+  them per =lsn_check_interval=?
+- Test: partition-primary-from-replicas + promote nemesis. Elle should see
+  lost updates / G0 if writes split across two primaries.
+
+** H9: Session settings leaking across pooled clients weakens isolation
+- If =SET default_transaction_isolation= or
+  =SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...= leaks to,
+  or fails to follow, a client across server connections, the client silently
+  gets a weaker isolation level.
+- Test: session-isolation-leak workload.
+
+** H10: Resharding cutover window
+- The drain reads =pg_current_wal_lsn()= after traffic stop and
+  =cancel_all(source_db)=. Questions:
+  - What about a txn that was already open when the barrier went up?
+  - What about a =COMMIT= cancelled mid-flight (indeterminate)?
+  - What about a 2PC txn in phase 2 at cutover?
+- =RESHARD= cutover is single-node only (=docs/RESHARDING.md:23=). The manual
+  =MAINTENANCE ON= / =RELOAD= / =MAINTENANCE OFF= flow is claimed to be atomic
+  across containers. Test both.
+
+* Known doc discrepancies (no Jepsen needed)
+
+Found while cross-checking the docs against the code. These go straight into
+the findings report.
+
+| # | Setting / topic                             | Docs say                                                              | Code says                                                      |
+|---+---------------------------------------------+-----------------------------------------------------------------------+----------------------------------------------------------------|
+| D1 | =two_phase_commit_auto= default            | general settings page: =true=; 2PC page: disabled                    | =false= (=backend/pool/cluster.rs:273=, "Disable by default") |
+| D2 | =two_phase_commit_wal_fsync_interval= default | general settings page: =2= (ms); crash-recovery page: =0=            | =0= (=pgdog-config/src/general.rs:1198=)                      |
+| D3 | =two_phase_commit_wal_checkpoint_interval= default | general settings page: =60= (s); crash-recovery page: =15_000= ms | =15_000= ms (=pgdog-config/src/general.rs:1202=)              |
+| D4 | =NODE_ID= and 2PC                           | not mentioned                                                         | gid depends on it (see H1)                                     |
+| D5 | Clock requirements for =unique_id=          | none stated                                                           | code assumes "reasonably accurate and synchronized" clocks    |
+
+D1 matters for the test matrix: a user who reads the general settings page
+believes cross-shard autocommit writes are atomic by default. They aren't.
+
+* Test environment
+
+** Decision: VMs, control node on the host
+Use libvirt/virt-manager VMs, not Docker. Docker containers share the host
+kernel's clock, so Jepsen's clock nemesis would skew every "node" (and the
+host) together. That makes C8/H7 untestable. LazyFS needs FUSE, which is
+also awkward in containers. VMs give each node its own clock, kernel, page
+cache and fsync behaviour.
+
+Setup:
+- *Control node = the host* (Debian 13). Install a JDK (21) and Leiningen.
+  Build PgDog on the host with =cargo build --release=. The VMs run the same
+  Debian release, so glibc matches and the binary can be uploaded as is.
+- *Base VM:* Debian stable (13), minimal, 2 vCPU / 4 GB / 20 GB disk.
+  - Root SSH with the host's key; =sudo=, =iptables=, =iproute2=.
+  - =build-essential= (Jepsen compiles its clock helper on the nodes);
+    =fuse3=, =libfuse3-dev=, =cmake=, =g++=, =git= (LazyFS).
+  - =chrony= installed but stoppable (the clock nemesis stops NTP).
+  - Snapshot the VM once configured.
+- *Clone* it 5× with =virt-clone= into =n1=…=n5=. Give each a fresh
+  machine-id and SSH host keys, plus a static DHCP reservation on the libvirt
+  default network. Add =n1=…=n5= to =/etc/hosts= on the host and on every VM.
+- Postgres from the PGDG apt repo, installed by =db.clj= rather than baked in,
+  so the Postgres version can vary per run.
+- Keep a libvirt snapshot of the clean cluster. If a run leaves a node
+  wedged (e.g. a clock left at a strange value), revert instead of debugging.
+- Jepsen's Docker env is still handy for fast iteration on client and checker
+  code in M0. Results that count come from the VMs.
+
+** Topology
+Jepsen needs a control node plus N DB nodes it can SSH to as root. PgDog and
+Postgres run on separate nodes, so we can partition them from each other.
+
+| Node | Role (sharded topology)        | Role (replication topology)  |
+|------+--------------------------------+------------------------------|
+| n1   | PgDog A                        | PgDog A                      |
+| n2   | PgDog B (multi-instance tests) | PgDog B                      |
+| n3   | Postgres shard 0               | Postgres primary             |
+| n4   | Postgres shard 1               | Postgres replica (streaming) |
+| n5   | Postgres shard 2               | Postgres replica (streaming) |
+
+Jepsen's =db/DB= is per-node, so write one =pgdog.jepsen.db= that dispatches
+on the node's role. It installs Postgres from PGDG apt, uploads a PgDog
+binary built on the control node, and writes =pgdog.toml= / =users.toml=. It
+should implement =db/Kill=, =db/Pause=, =db/Primary= and =db/LogFiles=, so
+=jepsen.nemesis.combined/nemesis-package= works without changes.
+
+** Repo layout
+Follow the existing integration convention (each suite in
+=integration/<name>/= with its own =run.sh=, run directly and not through
+=integration/run.sh=):
+
+#+begin_example
+integration/jepsen/
+  run.sh                 # builds pgdog, brings up nodes, runs a smoke matrix
+  project.clj            # Leiningen; jepsen, elle, next.jdbc, pgjdbc
+  resources/pgdog.toml.selmer, users.toml.selmer
+  src/pgdog/jepsen/
+    core.clj             # CLI, test map, workload/nemesis selection
+    db.clj               # Postgres + PgDog install/start/kill/pause/promote
+    client.clj           # next.jdbc client; error -> :fail/:info classification
+    nemesis.clj          # pgdog-specific faults (admin RELOAD, MAINTENANCE, promote, LazyFS WAL)
+    checker/             # orphan-2pc, final-atomicity, staleness, session-leak
+    workload/            # append, bank, unique_ids, shard_move, session_leak, rw_split
+#+end_example
+
+** Client details
+- next.jdbc + pgjdbc, connecting to PgDog on n1/n2 (round-robin per
+  process). Run the same workloads with =--control= pointed straight at
+  Postgres, so anomalies can be attributed to PgDog or to Postgres.
+- Protocol matrix: =prepareThreshold=0= (unnamed statements) and
+  =prepareThreshold=1= (named prepared statements, which exercises PgDog's
+  prepared-statement rewriting), plus =preferQueryMode=simple=.
+- Error classification is the most important part of the client:
+  - =:fail= only when we know the txn did not commit: SQLSTATE 40001/40P01
+    before COMMIT, errors before COMMIT is sent, constraint violations.
+  - =:info= for connection loss, timeouts, and anything during COMMIT.
+    Exception: the H4 probe mode, where COMMIT errors are deliberately =:fail=.
+- Key placement: use =sharded_mapping= list sharding so the workload knows
+  each key's shard. That makes single-shard vs. cross-shard txns explicit.
+  Repeat the main runs with default hash sharding, to cover the hash path.
+
+** Final generator (every test)
+1. Heal all faults, resume paused processes, restore clocks, restart killed
+   nodes.
+2. Wait for PgDog 2PC recovery. Poll =SHOW TRANSACTIONS= on the admin DB and
+   =pg_prepared_xacts= on each shard, with a deadline (e.g. 60 s).
+3. Final reads through PgDog *and* directly against each shard. The direct
+   reads are ground truth for the final-state checkers.
+
+* Workloads
+
+| Workload             | Basis                               | Claims        | Checker / expected model                                                         |
+|----------------------+-------------------------------------+---------------+-----------------------------------------------------------------------------------|
+| =append= (1 shard)   | Elle list-append                    | C1, C3        | =:serializable= at SERIALIZABLE, =:snapshot-isolation= at REPEATABLE READ, =:read-committed= at READ COMMITTED |
+| =append= (x-shard)   | Elle list-append, keys on ≥2 shards | C4, C5, C12   | Elle at =:read-committed= (G0, G1a/b/c); classify the remaining anomalies; final-atomicity |
+| =bank=               | =jepsen.tests.bank=                 | C4, C5        | Total conserved in final direct read; intermediate cross-shard reads are expected to drift |
+| =multi-insert=       | custom                              | C6            | Each txn's tuples all present or all absent at the end                           |
+| =shard-move=         | custom                              | C7            | Every logical row exists exactly once; no lost value updates                     |
+| =unique-ids=         | =checker/unique-ids=                | C8            | No duplicate IDs across nodes and restarts                                       |
+| =session-leak=       | custom                              | C2, H9        | Each txn reports the =transaction_isolation= its client asked for                |
+| =rw-split=           | custom register + LSN probes        | C9            | Writes only on primary; read staleness ≤ =ban_replica_lag= + check interval     |
+| =failover=           | Elle list-append / rw-register      | C10, H8       | No G0/lost acked writes attributable to PgDog (sync replication isolates PgDog's part) |
+| =reshard=            | Elle list-append across =RESHARD=   | C11, H10      | No lost acked appends; nothing written to the old cluster after cutover is lost  |
+
+** Custom checkers
+- *orphan-2pc*: after the recovery deadline, =pg_prepared_xacts= has no
+  =__pgdog_2pc_%= gids on any shard. Report gids and ages.
+- *final-atomicity*: each cross-shard txn writes a unique token to keys on
+  several shards. In the final direct read, every token is present on all of
+  its shards or on none. =:ok= txns must be present everywhere, =:fail= txns
+  absent everywhere, =:info= either way.
+- *errored-commit-visible* (H4): any =:fail= txn whose token is visible in the
+  final read.
+- *staleness*: for replica reads, the distance between the value read and the
+  latest acked write at invocation time, in ms and LSN bytes.
+
+* Nemeses
+
+| Fault                               | Target           | Mechanism                                              | Exercises        |
+|-------------------------------------+------------------+--------------------------------------------------------+------------------|
+| kill / restart                      | PgDog            | SIGKILL, restart with the same WAL dir                 | C5, H1, H7       |
+| kill / restart, fresh WAL dir       | PgDog            | SIGKILL, wipe WAL dir                                  | H2               |
+| kill / restart, no =NODE_ID=        | PgDog            | as above, env unset                                    | H1               |
+| pause                               | PgDog            | SIGSTOP/SIGCONT                                        | C5, timeouts     |
+| partition PgDog ↔ one shard         | network          | =jepsen.net= iptables                                  | C4, C5, H4       |
+| partition client ↔ PgDog            | network          | iptables on n1/n2                                      | C5 (client vanishes mid-2PC) |
+| kill / pause shard                  | Postgres         | =pg_ctl stop -m immediate=, SIGSTOP                    | C4, C5           |
+| lose unfsynced writes               | PgDog WAL dir    | =jepsen.lazyfs= mounted at =two_phase_commit_wal_dir=  | H3               |
+| clock bump / strobe                 | PgDog nodes      | =jepsen.nemesis.time=                                  | C8, H7           |
+| promote replica                     | Postgres         | =pg_ctl promote=, optionally after isolating primary   | C10, H8          |
+| admin ops                           | PgDog admin DB   | =RELOAD=, =MAINTENANCE ON/OFF=, =RECONNECT=, pool pause | C2, C11          |
+| reshard                             | PgDog            | =RESHARD= / =COPY_DATA= + manual cutover               | C11, H10         |
+
+Inject crashes at 2PC phase boundaries more reliably: add a test-only hook
+(env var or a feature-gated failpoint, e.g. the =fail= crate) that aborts or
+sleeps the process right after the phase-1 WAL write, after =PREPARE= on k of
+n shards, and after the phase-2 WAL write. Random SIGKILL will rarely land in
+these windows.
+
+* Milestones
+
+** TODO M0: Harness bring-up
+- [ ] Base Debian VM built and snapshotted; n1–n5 cloned; host can SSH to all
+      as root; =/etc/hosts= consistent
+- [ ] JDK + Leiningen on the host; Jepsen's =lein run test --nodes n1,...=
+      reaches every node
+- [ ] =db.clj= installs Postgres on n3–n5, uploads and starts PgDog on n1–n2
+- [ ] =append= with a noop nemesis passes against raw Postgres and through PgDog
+- [ ] =integration/jepsen/run.sh= runs a 60 s smoke test
+Exit: green noop run through PgDog; =store/= has logs from every node.
+
+** TODO M1: PgDog as a plain pooler (C1, C2)
+- Single Postgres, transaction pooling, pool much smaller than client count
+  so server connections are shared.
+- =append= at all three isolation levels; =session-leak=.
+- Nemeses: PgDog kill/pause, client↔PgDog partition, admin =RELOAD= /
+  =RECONNECT=.
+- Every config also runs with =--control= (direct to Postgres). Anomalies seen
+  only through PgDog are PgDog's.
+Exit: results identical to the control, or anomalies triaged.
+
+** TODO M2: Sharded, direct-to-shard (C3)
+- 3 shards, list mapping, every txn touches one shard.
+- Same nemeses as M1 plus shard kill/partition.
+Exit: per-shard Elle results match the Postgres control.
+
+** TODO M3: Cross-shard 2PC (C4, C5, C12, H1–H5). The main event.
+Matrix (prune once the results stabilise):
+- =two_phase_commit=: off (expected to fail atomicity, which validates the
+  checker) / on
+- =two_phase_commit_auto=: off / on
+- =NODE_ID=: set / unset
+- WAL: persistent / wiped on restart / LazyFS
+- fsync interval: 0 / 100 ms
+- PgDog nodes: 1 / 2
+- protocol: simple / extended / named prepared
+Workloads: x-shard =append=, =bank=, plus the error-injection op for C12.
+Exit: every hypothesis H1–H5 confirmed or refuted, and each written up in the
+findings report.
+
+** TODO M4: Query rewrites (C6, C7, H6)
+- =multi-insert= and =shard-move= with 2PC off/on, under kill and partition
+  nemeses.
+
+** TODO M5: Unique IDs (C8, H7)
+- 2 PgDog nodes with distinct =NODE_ID=; both =Standard= and =Compact=
+  =unique_id_function=.
+- Clock bump (±seconds to minutes) combined with kill/restart.
+- Write down the clock error bound the docs should state.
+
+** TODO M6: Replicas, load balancing, failover (C9, C10, H8)
+- Replication topology. Run once with =synchronous_commit = remote_apply=
+  (anything lost is then PgDog's doing) and once async (to document what users
+  should actually expect).
+- Each =read_write_split= mode, =role = "auto"= vs. explicit roles.
+- Promotion nemesis, with and without isolating the old primary.
+
+** TODO M7: Resharding cutover (C11, H10)
+- Single PgDog: =RESHARD= with automatic cutover under =append= load. Vary
+  =cutover_timeout_action= and the lag thresholds.
+- Two PgDogs: manual =MAINTENANCE ON= → =RELOAD= → =MAINTENANCE OFF= on both.
+- Add PgDog kill and shard partition during each cutover phase.
+
+** TODO M8: Findings report and hand-off
+- Write the findings report (see below) and present it to the PgDog devs
+  through the Aura contract.
+- With their agreement: turn each confirmed bug into a fast regression test
+  (Rust unit test or a Python integration test next to
+  =integration/two_pc/=), and offer the Jepsen suite upstream, including a
+  nightly CI job running a short (5 min) default-nemesis pass per workload.
+
+* Reporting and triage
+
+Findings are triaged privately first and presented to the PgDog devs as a
+report. Nothing goes to public GitHub issues, PRs or Discord until they have
+seen it.
+
+- Keep this file, the Jepsen suite and the results on a local/private branch.
+  This file already names suspected bugs, so don't push it to a public remote
+  (or add =PLAN.org= and =integration/jepsen/= to =.git/info/exclude=).
+- Jepsen =store/= directories (histories, node logs, Elle anomaly graphs)
+  are the evidence. Archive the runs referenced by the report.
+- Report structure, one entry per finding:
+  1. Claim violated (C#, with a docs quote) or doc discrepancy (D#)
+  2. Severity: data loss / atomicity violation / stuck locks / stale read /
+     doc-only
+  3. Minimal reproducer: Jepsen command line, PgDog commit, config, nemesis
+     schedule. Use a deterministic failpoint repro where we have one.
+  4. Evidence: Elle anomaly excerpt, or checker output (orphaned gids,
+     duplicated IDs, ...)
+  5. Root cause pointer (file:line), if understood
+  6. Suggested fix and a proposed regression test
+- Also include what was tested and found to hold, along with the fault
+  coverage. A clean result is useful to the PgDog devs too.
+
+* Results
+| Claim | Config | Nemesis | Outcome | Run (store path) | Finding # |
+|-------+--------+---------+---------+------------------+-----------|
+
+* Open questions
+- Which edition/version is in scope? Some features (e.g. automatic
+  =RESHARD= cutover) may be EE-only. Does the Aura contract give access to EE
+  builds?
+- Postgres versions to cover (the oldest supported plus latest?).
+- Ask the PgDog devs during triage: is =NODE_ID= meant to be required for 2PC
+  (see H1/D4)? The docs don't say so either way.
