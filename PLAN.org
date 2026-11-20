@@ -357,7 +357,7 @@ these windows.
 
 * Milestones
 
-** TODO M0: Harness bring-up
+** DONE M0: Harness bring-up
 - [X] Incus installed; Docker =DOCKER-USER= rules in place for =incusbr0=
 - [X] =nodes.sh up= creates n1–n5 VMs; the host can SSH to all of them as
       root; =/etc/hosts= is consistent; =clean= snapshots exist
@@ -370,9 +370,9 @@ these windows.
 - [X] =append= with a noop nemesis passes against raw Postgres and through
       PgDog (Elle =:valid? true= for both; 30 s runs, ~2.7k ok txns, no
       =:info= ops)
-- [X] =integration/jepsen/run.sh= runs a 60 s smoke test (control: 5666 ok /
-      333 fail / 0 info; PgDog: 5344 ok / 363 fail / 0 info; Elle valid for
-      both)
+- [X] =integration/jepsen/run.sh= runs a 60 s smoke test and exits 0 (control:
+      5496 ok / 547 fail / 0 info; PgDog: 4987 ok / 690 fail / 0 info;
+      =:valid? true= for both)
 - [X] =gnuplot= on the host (the perf checker needs it; without it the overall
       verdict is =:unknown= even when Elle passes)
 Exit: green noop run through PgDog; =store/= has logs from every node.
