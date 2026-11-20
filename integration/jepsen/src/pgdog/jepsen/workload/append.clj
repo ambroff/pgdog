@@ -14,7 +14,13 @@
                                  UPDATE again
     --append-path mixed          either, per micro-op
     --read-by pk | sk | mixed    read by primary key, or by the unindexed
-                                 secondary key `sk` (a table scan), or either"
+                                 secondary key `sk` (a table scan), or either
+
+  In sharded mode (M2, claim C3) every txn touches keys on one shard only:
+  one Elle generator runs per shard, its keys mapped into that shard's key
+  space (pgdog.jepsen.shard), and each op carries :shard. Elle checks each
+  shard's sub-history on its own. Reads by sk have no shard key, so PgDog
+  broadcasts them: a cross-shard read inside an otherwise single-shard txn."
   (:require [clojure.string :as str]
             [jepsen [checker :as checker]
                     [client :as client]
@@ -22,9 +28,11 @@
             [jepsen.generator :as gen]
             [jepsen.random :as rand]
             [jepsen.tests.cycle.append :as append]
+            [elle.list-append :as la]
             [next.jdbc :as j]
             [pgdog.jepsen.client :as pc]
-            [pgdog.jepsen.db :as db])
+            [pgdog.jepsen.db :as db]
+            [pgdog.jepsen.shard :as shard])
   (:import (java.sql Connection)))
 
 (defn parse-list [s]
@@ -76,13 +84,17 @@
             (throw e)))))))
 
 (defn mop!
-  [test conn [f k v :as mop]]
+  "Runs one micro-op. Final reads (final? true) always read by primary key:
+  they are the ground truth for the checkers, and a read by sk is broadcast
+  to every shard."
+  [test final? conn [f k v :as mop]]
   (let [t (table test k)]
     (case f
       :r
-      (let [col (name (pick (:read-by test) [:pk :sk]))
+      (let [col (if final? "pk" (name (pick (:read-by test) [:pk :sk])))
             col (if (= "pk" col) "k" "sk")
-            row (j/execute-one! conn [(str "SELECT v FROM " t " WHERE " col " = ?") k])]
+            row (j/execute-one! conn [(str "SELECT v FROM " t " WHERE " col " = ?") k]
+                                (pc/jdbc-opts test))]
         [f k (parse-list (some-> row vals first))])
 
       :append
@@ -106,6 +118,43 @@
               test ctx)))
   (update [this _ _ _] this))
 
+;; ---------------------------------------------------------------------------
+;; Sharded mode: one generator per shard
+
+(defn shard-gen
+  "Elle's append generator for shard s, with its local keys 0, 1, ...
+  mapped to the shard's keys."
+  [test elle-opts s]
+  (map (fn [op]
+         (-> op
+             (assoc :shard s)
+             (update :value (partial mapv (fn [[f k v]] [f (shard/key-of test s k) v])))))
+       (la/gen elle-opts)))
+
+(defn shard-key-tracker
+  "Like cycle/max-key-tracker: keeps {shard #{key}} of every key a txn used
+  in (:shard-keys ctx), for the final reads."
+  [gen]
+  (gen/track :shard-keys {}
+             (fn [m {:keys [f value] :as op}]
+               (if (and (= :txn f) (:shard op))
+                 (update m (:shard op) (fnil into (sorted-set)) (map second value))
+                 m))
+             gen))
+
+(defrecord ShardFinalReads []
+  ;; Reads every key each shard's generator used, 8 per txn, one shard per
+  ;; txn, marked :final?.
+  gen/Generator
+  (op [_ test ctx]
+    (when-let [sk (:shard-keys ctx)]
+      (gen/op (for [[s ks] (sort sk)
+                    group  (partition-all 8 ks)]
+                {:f :txn, :final? true, :shard s,
+                 :value (mapv (fn [k] [:r k nil]) group)})
+              test ctx)))
+  (update [this _ _ _] this))
+
 (def neighbor-counter
   "Alternates clients between append clients and neighbors (--neighbors)."
   (atom 0))
@@ -117,7 +166,7 @@
   tables, so the op completes as :fail and Elle ignores it."
   [test node conn-atom op]
   (try
-    (let [^Connection conn (or @conn-atom (reset! conn-atom (pc/open test node)))]
+    (let [^Connection conn (or @conn-atom (reset! conn-atom (pc/open test node (:shard op) {})))]
       (.setAutoCommit conn true)
       (.setTransactionIsolation conn Connection/TRANSACTION_READ_COMMITTED)
       (j/execute! conn ["SELECT 1"])
@@ -127,24 +176,48 @@
       (reset! conn-atom nil)
       (assoc op :type :fail, :error [:neighbor (pc/error-type e)]))))
 
-(defrecord Client [node conn neighbor?]
+(defn conn-for
+  "The connection atom for an op. Every op shares one, except in sharded
+  --control mode, where a txn connects straight to its shard's Postgres and
+  each shard gets its own."
+  [test conns op]
+  (let [k (when (and (:control test) (= :sharded (:mode test))) (:shard op))]
+    (or (get @conns k)
+        (get (swap! conns #(if (contains? % k) % (assoc % k (atom nil)))) k))))
+
+(defrecord Client [node conns neighbor?]
   client/Client
   (open! [_ test node]
-    (Client. node (atom nil)
+    (Client. node (atom {})
              (and (:neighbors test) (odd? (swap! neighbor-counter inc)))))
 
   (setup! [_ test])
 
   (invoke! [_ test op]
-    (if (and neighbor? (not (:final? op)))
-      (neighbor! test node conn op)
-      (pc/run-txn! test node conn op
-                   (fn [c] (mapv (partial mop! test c) (:value op))))))
+    (let [conn (conn-for test conns op)
+          txn! #(pc/run-txn! test node conn op
+                             (fn [c] (mapv (partial mop! test (:final? op) c) (:value op))))]
+      (cond
+        (and neighbor? (not (:final? op)))
+        (neighbor! test node conn op)
+
+        ;; Final reads check that the system recovered, not that the
+        ;; client's old socket survived: a connection killed while idle
+        ;; (e.g. by a terminate-all) fails on first use. run-txn! has
+        ;; dropped it by then, so retry once on a fresh connection.
+        (:final? op)
+        (let [r (txn!)]
+          (if (and (not= :ok (:type r)) (pc/connection-loss? r))
+            (assoc (txn!) :retried-error (:error r))
+            r))
+
+        :else
+        (txn!))))
 
   (teardown! [_ test])
 
   (close! [_ test]
-    (pc/close! @conn)))
+    (doseq [a (vals @conns)] (pc/close! @a))))
 
 (def consistency-model
   "Strongest model Postgres claims at each isolation level, for any topology."
@@ -163,12 +236,14 @@
    :read-committed  :read-committed})
 
 (defn consistency-models
-  "Models Elle checks: --consistency-models if given, else the strong model
-  in pooler mode and the plain one otherwise."
+  "Models Elle checks: --consistency-models if given, else the strong model.
+  In sharded mode Elle checks each shard's sub-history on its own (see
+  per-shard-checker), and one Postgres per sub-history is the setting the
+  strong models were found to hold in. Real-time order across shards is not
+  promised and is not checked."
   [opts]
   (or (seq (:consistency-models opts))
-      [((if (= :pooler (:mode opts)) strong-consistency-model consistency-model)
-        (:isolation opts))]))
+      [(strong-consistency-model (:isolation opts))]))
 
 (defn txn-only
   "Elle reads every client op as a transaction; hide anything else."
@@ -176,6 +251,22 @@
   (reify checker/Checker
     (check [_ test history opts]
       (checker/check c test (h/filter-f :txn history) opts))))
+
+(defn per-shard-checker
+  "Runs Elle on each shard's txns separately (ops tagged :shard), writing
+  each shard's Elle output under shard-<s>/."
+  [elle-opts]
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [results (into (sorted-map)
+                          (for [s (range (shard/shard-count test))]
+                            [s (checker/check
+                                 (append/checker elle-opts) test
+                                 (h/filter #(and (= :txn (:f %)) (= s (:shard %))) history)
+                                 (assoc opts :subdirectory (str "shard-" s)))]))]
+        {:valid? (checker/merge-valid (map :valid? (vals results)))
+         :anomaly-types (->> (vals results) (mapcat :anomaly-types) distinct sort vec)
+         :shards  results}))))
 
 (defn lost-appends-checker
   "Every element appended by an :ok txn must be in the final read of its key
@@ -210,15 +301,26 @@
 
 (defn workload
   [opts]
-  (let [w (append/test {:key-count          (:key-count opts 10)
-                        :min-txn-length     1
-                        :max-txn-length     (:max-txn-length opts 4)
-                        :max-writes-per-key (:max-writes-per-key opts 32)
-                        :consistency-models (consistency-models opts)})]
-    (assoc w
-           :client          (Client. nil nil false)
-           :final-generator (FinalReads.)
-           :checker (checker/compose {:elle      (txn-only (:checker w))
-                                      :isolation (pc/isolation-checker)
-                                      :lost      (lost-appends-checker)
-                                      :backends  (pc/backend-checker)}))))
+  (let [elle-opts {:key-count          (:key-count opts 10)
+                   :min-txn-length     1
+                   :max-txn-length     (:max-txn-length opts 4)
+                   :max-writes-per-key (:max-writes-per-key opts 32)
+                   :consistency-models (consistency-models opts)}
+        common    {:isolation (pc/isolation-checker)
+                   :lost      (lost-appends-checker)
+                   :backends  (pc/backend-checker)}]
+    (if (= :sharded (:mode opts))
+      {:client          (Client. nil nil false)
+       :generator       (gen/mix (mapv (partial shard-gen opts elle-opts)
+                                       (range (shard/shard-count opts))))
+       :wrap-generator  shard-key-tracker
+       :final-generator (ShardFinalReads.)
+       :checker         (checker/compose
+                          (assoc common
+                                 :elle      (per-shard-checker elle-opts)
+                                 :placement (pc/placement-checker)))}
+      (let [w (append/test elle-opts)]
+        (assoc w
+               :client          (Client. nil nil false)
+               :final-generator (FinalReads.)
+               :checker (checker/compose (assoc common :elle (txn-only (:checker w)))))))))

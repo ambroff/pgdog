@@ -15,7 +15,8 @@
                     [role :as role]
                     [util :refer [meh]]]
             [jepsen.control.util :as cu]
-            [jepsen.os.debian :as debian]))
+            [jepsen.os.debian :as debian]
+            [pgdog.jepsen.shard :as shard]))
 
 (def user "jepsen")
 (def password "jepsen")
@@ -98,18 +99,35 @@
       ["append"]
       (mapv #(str "append_" %) (range n)))))
 
+(def probe-table
+  "Sharded mode: one row per shard, at the shard's anchor key (see
+  shard/anchor). Probe statements select from it by k, so PgDog routes them
+  to the txn's shard like any other keyed statement."
+  "jepsen_probe")
+
+(defn shard-index
+  "Index of a Postgres node among the shards, in config order."
+  [test node]
+  (.indexOf ^java.util.List (role/nodes test :postgres) node))
+
 (defn schema
   "DDL for every workload. Kept here (not in clients) so it is applied directly
   on each Postgres node, independent of PgDog's DDL routing. `sk` is a
   secondary key with no index (always equal to k), for reads that must scan
-  the table (--read-by sk)."
-  [test]
-  (for [t (append-tables test)]
-    (str "CREATE TABLE IF NOT EXISTS " t
-         " (k bigint PRIMARY KEY, sk bigint NOT NULL, v text NOT NULL)")))
+  the table (--read-by sk). In sharded mode `node` gets the probe row of its
+  own shard only, where PgDog would have put it."
+  [test node]
+  (concat
+    (for [t (append-tables test)]
+      (str "CREATE TABLE IF NOT EXISTS " t
+           " (k bigint PRIMARY KEY, sk bigint NOT NULL, v text NOT NULL)"))
+    [(str "CREATE TABLE IF NOT EXISTS " probe-table " (k bigint PRIMARY KEY)")]
+    (when (= :sharded (:mode test))
+      [(str "INSERT INTO " probe-table " VALUES ("
+            (shard/anchor test (shard-index test node)) ")")])))
 
 (defn configure-postgres!
-  [test]
+  [test node]
   (c/exec :mkdir :-p (str (pg-conf-dir test) "/conf.d"))
   (cu/write-file!
     (str/join "\n"
@@ -120,6 +138,8 @@
                ;; Logical replication is needed for resharding tests later.
                "wal_level = logical"
                "log_line_prefix = '%m [%p] %q%u@%d '"
+               ;; Lets a client see which node a statement ran on.
+               (str "cluster_name = '" node "'")
                ""])
     (str (pg-conf-dir test) "/conf.d/jepsen.conf"))
   (let [hba (str (pg-conf-dir test) "/pg_hba.conf")]
@@ -130,12 +150,12 @@
   (cu/await-tcp-port pg-port {:timeout 60000}))
 
 (defn create-database!
-  [test]
+  [test node]
   (psql! (str "DROP DATABASE IF EXISTS " database " WITH (FORCE)"))
   (psql! (str "DROP ROLE IF EXISTS " user))
   (psql! (str "CREATE ROLE " user " LOGIN PASSWORD '" password "'"))
   (psql! (str "CREATE DATABASE " database " OWNER " user))
-  (doseq [ddl (schema test)]
+  (doseq [ddl (schema test node)]
     (psql! database (str "SET ROLE " user "; " ddl))))
 
 (defrecord Postgres []
@@ -143,8 +163,8 @@
   (setup! [_ test node]
     (c/su
       (install-postgres! test)
-      (configure-postgres! test)
-      (create-database! test)))
+      (configure-postgres! test node)
+      (create-database! test node)))
 
   (teardown! [_ test node]
     (c/su
@@ -213,12 +233,17 @@
                         (str "database_name = " (toml-str database))
                         (str "shard = " shard)])
                      pg-nodes))
+        ;; Every table is sharded on k with the same placement (see
+        ;; pgdog.jepsen.shard). Mapping entries attach to the
+        ;; [[sharded_tables]] entry just above them.
         sharding (when (= :sharded (:mode test))
-                   (for [t (append-tables test)]
-                     ["[[sharded_tables]]"
-                      (str "database = " (toml-str database))
-                      (str "name = " (toml-str t))
-                      "column = \"k\""]))
+                   (for [t (conj (append-tables test) probe-table)]
+                     (concat ["[[sharded_tables]]"
+                              (str "database = " (toml-str database))
+                              (str "name = " (toml-str t))
+                              "column = \"k\""
+                              "data_type = \"bigint\""]
+                             (shard/mapping-toml test))))
         admin    ["[admin]"
                   (str "name = " (toml-str admin-database))
                   (str "user = " (toml-str admin-user))

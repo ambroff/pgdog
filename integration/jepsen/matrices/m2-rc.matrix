@@ -1,0 +1,8 @@
+# M2: RC runs small enough for Elle's cycle search (the 120 s, 32
+# writes/key RC runs time out online and run out of memory offline at 28 GB).
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 60 --max-writes-per-key 8
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 60 --max-writes-per-key 8 --control
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 60 --max-writes-per-key 8 --read-by sk
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 60 --max-writes-per-key 8 --read-by sk --control
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 90 --max-writes-per-key 8 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 90 --max-writes-per-key 8 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6 --control

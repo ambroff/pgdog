@@ -19,15 +19,16 @@ shift
 cd "$SCRIPT_DIR"
 mkdir -p store
 summary="store/matrix-$(date +%Y%m%dT%H%M%S).tsv"
-printf 'exit\tvalid\tok\tfail\tinfo\tanomalies\twrong\tfirst-wrong-s\tbackends\tpools\tstore\targs\n' | tee "$summary"
+printf 'exit\tvalid\tok\tfail\tinfo\tanomalies\twrong\tfirst-wrong-s\tbackends\tpools\tplacement\txacts/txn\tstore\targs\n' | tee "$summary"
 
 # Pulls a count out of results.edn. The first match is in the top-level
 # :stats map, which comes before any workload checker output.
 field() { grep -m1 -oP ":$1 \K\d+" "$2"; }
 # Any token after a key (nil, true, 1.23, ...), first match or "-".
 token() { grep -m1 -oP ":$1 \K[^,}\s]+" "$2" || echo -; }
-# Elle's anomaly types, e.g. G2-item+G-single-item, or "-".
-anomalies() { grep -m1 -oP ':anomaly-types \(\K[^)]*' "$1" | tr ' ' '+' | sed 's/://g' || true; }
+# Elle's anomaly types, e.g. G2-item+G-single-item, or "-". Sharded runs
+# have one Elle result per shard; this is the union.
+anomalies() { grep -oP ':anomaly-types [(\[]\K[^)\]]*' "$1" | tr ' ' '\n' | sed 's/://g' | grep . | sort -u | paste -sd+ || true; }
 # :valid? of a named sub-checker, e.g. :backends {... :valid? true}.
 subvalid() { grep -A40 -m1 -P "^\s*:$1 \{" "$2" | grep -m1 -oP ':valid\? \K[^,}\s]+' || echo -; }
 
@@ -50,9 +51,11 @@ while IFS= read -r line; do
         first=$(token first-wrong-s "$results")
         backends=$(subvalid backends "$results")
         pools=$(subvalid pools "$results")
+        placement=$(subvalid placement "$results")
+        xpt=$(token xacts-per-txn "$results")
     else
-        valid=missing ok=- fail=- info=- anom=- wrong=- first=- backends=- pools=-
+        valid=missing ok=- fail=- info=- anom=- wrong=- first=- backends=- pools=- placement=- xpt=-
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$valid" "$ok" "$fail" "$info" \
-        "$anom" "$wrong" "$first" "$backends" "$pools" "${run#"$SCRIPT_DIR"/}" "$line" | tee -a "$summary"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$valid" "$ok" "$fail" "$info" \
+        "$anom" "$wrong" "$first" "$backends" "$pools" "$placement" "$xpt" "${run#"$SCRIPT_DIR"/}" "$line" | tee -a "$summary"
 done <"$matrix"

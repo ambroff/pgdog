@@ -635,7 +635,7 @@ Notes:
   =recheck --cycle-search-timeout= offline; give lein more heap with
   =lein update-in : assoc :jvm-opts '["-Xmx20g"]' -- run ...=.
 
-** TODO M2: Sharded, direct-to-shard (C3)
+** DONE M2: Sharded, direct-to-shard (C3)
 - 3 shards, list mapping, every txn touches one shard.
 - Same nemeses as M1 plus shard kill/partition, plus the backend faults from
   M1b. Runs with =--strict-commit-errors= will show F5 until it is fixed; to
@@ -648,6 +648,152 @@ Notes:
   results.
 - Check the per-shard histories against the strong models from M1b.
 Exit: per-shard Elle results match the Postgres control.
+
+Done 2026-11-20. Matrices: =matrices/m2.matrix= (48 runs;
+=store/matrix-20261120T080815.tsv=), =matrices/m2-followup.matrix= (11;
+=store/matrix-20261120T102007.tsv=), =matrices/m2-rc.matrix= (6;
+=store/matrix-20261120T105925.tsv=). All 48 main runs re-checked with the final
+checker code (=lein run reanalyze=).
+
+*C3 holds.* Per-shard Elle was valid (strict-serializable at SER,
+strong-snapshot-isolation at RR) in every run that finished its cycle
+search, under every fault, with list, range and hash placement, both
+protocols and named prepared statements, and the same as the control. In
+every run: no lost acked append, no row on the wrong shard, no key on two
+shards, final reads through PgDog equal to direct reads of each shard, every
+txn ran on its shard's node, and every txn ran at the requested isolation
+level (except the F1 row, as expected). RC needed smaller runs for Elle to
+finish (see the notes); those are valid too.
+
+Not clean, all liveness: F6 (RELOAD wedges a shard's pool), F7 (cross-shard
+pool deadlock), and the hidden fan-outs in N1/N2 below. Details in
+[[*Findings][Findings]].
+
+Routing, from reading the code before writing the harness (checked by
+adversarial re-reading; the fan-out was then confirmed by measurement):
+- The M1 client was never going to test a direct-to-shard txn as written:
+  - =SET TRANSACTION ...= and =SET SESSION CHARACTERISTICS ...= (=VAR_SET_MULTI=)
+    are routed to every shard (=router/parser/query/set.rs:19-24=; pinned by
+    =test_set.rs:272-296=). The same goes for =SAVEPOINT=, =RELEASE= and
+    =ROLLBACK TO= (=query/transaction.rs:25-29, 58-66=, a known TODO), and for
+    reads by a non-key column.
+  - =BEGIN= is buffered and replayed verbatim on every shard the txn joins
+    (=start_transaction.rs=, =server.rs:783-792=). Shards are only ever added
+    to a txn's binding, never dropped.
+  - Table-less =SELECT=s (the M1 =current_setting= / =pg_backend_pid()=
+    probes) go to a per-client sticky shard (=system_catalogs =
+    omnisharded_sticky=, =select.rs:141-173=), not to the txn's shard.
+- So with pgjdbc's usual =setAutoCommit(false)= + =SET TRANSACTION=, every
+  "single-shard" txn holds a server connection on every shard and =COMMIT=s
+  on all of them (measured: 3.0 Postgres txns per client txn). Isolation is
+  still right: =SET TRANSACTION= reaches every shard before any snapshot.
+  But a fault on any shard reaches every txn, and with =two_phase_commit= on
+  every write txn would go through 2PC. Doc gap / design note for the report:
+  "direct-to-shard" needs =BEGIN ISOLATION LEVEL ...= (or no isolation
+  statement) and no savepoints.
+
+Harness:
+- [X] =shard.clj=: key placement. One Elle generator per shard; local key j of
+      shard s maps to =s * 1e6 + j= (=--sharding list=, the default, and
+      =range=) or to the j-th integer that PgDog's default hasher sends to s
+      (=--sharding hash=; a port of =hashfn.c= =hashint8extended= with the
+      partition seed, matching test vectors from the C code).
+- [X] =pgdog.toml=: every table sharded on =k= as =bigint=, with
+      =[[sharded_tables.mapping]]= list values (=--list-size= per shard) or
+      ranges.
+- [X] =--isolation-mode begin=, the default in sharded mode: autocommit on,
+      =BEGIN ISOLATION LEVEL x= / =COMMIT= / =ROLLBACK= as statements.
+      =--isolation-mode txn= (=SET TRANSACTION=) is kept as a variant.
+- [X] Probes routed by key: =SELECT ... FROM jepsen_probe WHERE k = anchor(s)=,
+      a sharded table with one row per shard. They also return
+      =current_setting('cluster_name')= (set to the node name), so every ok
+      txn records the node it ran on. A probe that finds no row was misrouted
+      and aborts the txn.
+- [X] =--control= in sharded mode connects straight to the txn's shard.
+- [X] Elle runs per shard (=shard-<s>/=), at the strong models
+      (strict-serializable at SER, strong-snapshot-isolation at RR).
+      =recheck= splits sharded histories the same way.
+- [X] =placement= checker: every ok txn ran on its shard's node; after the
+      final reads, =:shard-dump= reads every table on every shard directly:
+      each row is on the shard its key maps to, on one shard only, and equals
+      the final read through PgDog. =xacts/txn= (from =pg_stat_database=)
+      measures fan-out: about 1 = direct-to-shard, about 3 = every shard.
+      Meaningless after a crash restart, which resets the counters.
+- [X] Backend faults hit a random shard per op; pids are keyed by node.
+      Txns that can fan out (=may-fan-out?=) get a looser attribution for
+      lost connections (=:fan-out-fault=), since the probes only see the
+      home shard's backend.
+- [X] Harness reviewed by independent readers; four confirmed harness bugs
+      fixed before the matrix (neighbor connections in sharded =--control=,
+      a checker crash on neighbor ops, fan-out attribution, dump errors
+      passing silently).
+- [X] Fixed while the matrix ran (all stored runs re-checked afterwards):
+  - The backend checker never matched role-restricted nemesis ops: Jepsen
+    names them =[:pgdog :kill]=, not =:kill=. This was already wrong in M1b
+    (its kill/pause runs passed only because errors overlapped some fault
+    op). =nemesis-f= normalises the name.
+  - Faults that persist (pause, kill, partitions, pool pause) now explain
+    errors from their start op until their heal op completes, plus 15 s (JDBC
+    socket timeout + checkout timeout): paused PgDogs and cut-off clients keep
+    row locks and server connections, which stalls clients elsewhere.
+  - Final reads always read by primary key (they are ground truth; reads by
+    sk are broadcast) and retry once on a fresh connection after a connection
+    error (in =--control=, a client's own idle connection may have been
+    terminated).
+  - =--jdbc-builder unqualified= is now the default (see N2): next.jdbc's
+    default builder made pgjdbc run catalog queries inside every txn.
+  - =lein run reanalyze DIR...= re-runs the backends / isolation / lost /
+    placement checkers on stored runs.
+- [X] Deterministic reproducers without Jepsen: =repro/sharded.sh=
+      (=reload-wedge=, =checkout-deadlock=).
+
+Results by group (PgDog rows; each with its control unless noted):
+- No faults, SER/RR/RC; list, range and hash placement; simple protocol;
+  =prepareThreshold=1=: valid. xacts/txn 1.07–1.26 with the qualified
+  builder; 0.98 with the unqualified builder (control: 0.98).
+- One fault per run (kill-pgdog, pause-pgdog, partition-clients, admin,
+  pause-pool, partition, kill-postgres, pause-postgres, terminate-backend,
+  kill-backend, restart-postgres): safety valid in all 11. The backends
+  checker failed in four, now explained: admin (F6); terminate-backend and
+  kill-backend (one or two errors each from a shard the txn had joined only
+  through N2's catalog lookups; with the unqualified builder both are clean:
+  0 unexplained); pause-pool (two checkout timeouts 20 s after a resume; not
+  seen again with the unqualified builder, most likely N2 as well).
+- =SET TRANSACTION= mode (N1): valid; 2.99 xacts/txn. Under shard kill/pause
+  it completed 19k txns against 25k / 44k for the begin-mode single-fault
+  runs.
+- Every fault at a 20 s interval, mixed paths, SER and RR: valid. Throughput
+  was very low (SER 9k ok / 141k fail in 240 s; RR 1.7k, and 3.3k in the
+  re-run). Not PgDog: the kill package left both PgDogs down for 31 s and
+  single PgDogs down for 14–51 s more, and clients pinned to a dead PgDog
+  fail fast with "connection refused" (73k of the re-run's failures).
+- Reads by sk (cross-shard read path), SER/RR/RC and SER under backend
+  faults: safety valid everywhere. With no faults through PgDog: 73 / 104 /
+  145 =FATAL checkout timeout= errors and throughput down to 27% / 30% / 4%
+  of the control (RC: 2.7k ok vs 75k). That is F7.
+- UPDATE/INSERT with savepoints, SER/RR/RC: valid; 1.8 xacts/txn (savepoints
+  go to every shard).
+- Session isolation with neighbors (F1 in sharded mode): 47 txns at the
+  wrong level, caught by the routed probe; Elle saw nothing in 60 s. Control
+  valid.
+- Follow-ups (=m2-followup.matrix=): with the unqualified builder, no faults
+  0.98 xacts/txn; terminate-backend, kill-backend, pause-pool all valid with 0
+  unexplained (a shard fault reaches no txn on another shard); admin wedged in
+  1 of 2 runs (F6) and not with the qualified builder (1 run); reads by sk
+  again F7, while =SET TRANSACTION= mode with the same reads (every shard
+  taken up front, in shard order) had no checkout timeouts and 2.4× (SER) /
+  16× (RC) the throughput.
+
+Notes:
+- Elle at RC: the PgDog run, its control and the RC sk control hit the 1 s
+  cycle search limit, and offline the search ran out of memory at 10 GB and
+  at 28 GB (as M1b's RC control did at 20 GB). =matrices/m2-rc.matrix= re-ran
+  RC smaller (60-90 s, 8 writes per key): valid through PgDog and in the
+  control, with no faults, with reads by sk (Elle; the backends checker
+  failed on F7's timeouts) and under every backend fault
+  (=store/matrix-20261120T105925.tsv=).
+- xacts/txn reads =pg_stat_database=, which a crash restart resets, and
+  counts neighbor queries; use it only from no-fault runs.
 
 ** TODO M3: Cross-shard 2PC (C4, C5, C12, H1–H5). The main event.
 Matrix (prune once the results stabilise):
@@ -904,6 +1050,180 @@ Found at =f8738bda0d41= (same PgDog source as F1–F4).
    while a client waits on =SELECT pg_sleep(10)= (so Postgres sends no
    =57P01=), and checks the client's SQLSTATE is 08xxx.
 
+** F6: =RELOAD= / =RECONNECT= under load can deadlock a sharded cluster until the next =RECONNECT=
+Found in M2 at =7523f83= (PgDog v0.1.65). Sharded clusters only.
+1. *Claims:* availability. =RELOAD= is how config changes are applied, and
+   it is a step of the resharding cutover (=MAINTENANCE ON=, =RELOAD=,
+   =MAINTENANCE OFF=, README "Re-sharding", =README.md:570-572=); nothing
+   warns that it can deadlock a sharded cluster under load. Relevant to M7
+   (C11), which runs that cutover under =append= load. Not a data-safety
+   violation (Elle, lost-appends, placement valid), but see severity.
+2. *Severity:* stuck locks and outage. Clients hold server connections
+   =idle in transaction= indefinitely, with their row locks. Every new
+   transaction on that PgDog then blocks at =BEGIN= (cluster-wide, all
+   shards); clients already in a transaction get =FATAL 58000 checkout
+   timeout=. It lasts until someone runs =RECONNECT=, and =RECONNECT= itself
+   can recreate it. No timeout applies (=query_timeout= defaults to unlimited).
+3. *Reproducer:* Jepsen =-w append --mode sharded --concurrency 20 --rate 1000
+   --time-limit 120 --nemesis admin= (=RELOAD= / =RECONNECT= every ~5 s): 2 of
+   4 runs wedged. Deterministic, pool size 1:
+   =bash integration/jepsen/repro/sharded.sh setup && ... reload-wedge=; the
+   script's comment has the timeline (A holds shard 2; B is in a txn with no
+   connection; =RELOAD=; B reads shard 2, queues behind the schema loader; the
+   loader's checkout times out and re-queues behind B; A commits, its
+   connection goes to B; B's next statement hangs).
+   Result (19:10:46Z, 3 shards, pool size 1): B's second read never
+   returned (killed by the script's 40 s timeout); a new client C's =BEGIN=
+   + read on shard 0 (another shard) hung for its whole 15 s; =SHOW POOLS=
+   for shard 2: =cl_waiting 1, sv_active 1, sv_idle_xact 1, healthy f=; the
+   log repeated =error loading schema for shard 2: all replicas down= at
+   19:11:01, :11, :21 while the health checks to n5 succeeded.
+4. *Evidence:*
+   - =pgdog-sharded-append-serializable-c20-t120-admin/2026-11-20T08:48:07=:
+     on n2, shard 0 stuck from a =RELOAD= at 16:49:13Z until a =RECONNECT= at
+     16:49:40; then shard 2 stuck from the =RELOAD= at 16:50:16Z to the end of
+     the run. Log: =ERROR error loading schema for shard 2: all replicas down=
+     every ~10 s while n5 was healthy. =SHOW POOLS= after the run: n5 pool
+     =sv_active 4, sv_idle_xact 4, cl_waiting 1, healthy false=; 8 final
+     reads failed.
+   - =.../2026-11-20T10:30:47= (harness with no catalog queries, so every
+     txn single-shard): n1 stuck on shard 1 from the =RELOAD= at 18:32:39Z; the
+     =RECONNECT= at 18:32:40 re-wedged it (the 4 new connections all went to
+     clients already in transactions).
+   - Never seen in pooler mode (M1/M1b ran =RELOAD= / =RECONNECT= under load):
+     schema loading is on only with more than one shard
+     (=cluster.rs:661-667=).
+5. *Root cause* (found by code reading, confirmed independently by six
+   reviewers against both runs): a cycle between clients and the per-shard
+   schema loader.
+   - A client in a transaction whose first checkout (or a later one, for an
+     extra shard) happens after the reload finds the old pool offline;
+     =ClusterConnection::get_conn= (=cluster_connection.rs:146-166=) calls
+     =safe_reload= and silently moves the transaction to the new =Cluster=,
+     then checks out from the new pool. Nothing waits for the new cluster to
+     be ready first.
+   - On its next statement, =cluster_check= (=route_query.rs:23-68=) skips the
+     online check because the client is in a transaction (line 31) but awaits
+     =wait_ready()= on the new cluster (lines 55-63), holding its connection,
+     bounded only by =query_timeout= (unlimited).
+   - Readiness waits for the schema on every shard (=cluster/launch.rs:109-117=).
+     The loader (=cluster/schema_loader.rs:70-99=) checks out through
+     =primary_or_replica= (=shard/mod.rs:93-97=) in the same FIFO queue as
+     clients; after a checkout timeout it re-queues at the tail. Once
+     =pool_size= such clients hold a shard's connections, the loader never gets
+     one, and the cluster is never ready.
+   - =RELOAD= also hands the old pool's taken set to the new pool
+     (=pool_impl.rs:316-345=), so the new pool starts full and the loader gets
+     only connections forwarded from old transactions, in FIFO order.
+     =RECONNECT= releases a wedge (=Cluster::shutdown= marks the old cluster
+     ready, =launch.rs:66-72=), but the clients it releases are already in
+     transactions on an offline cluster and stampede into the new pools,
+     re-running the race.
+   - Why my first, simpler repro did not wedge: a client that already holds a
+     connection keeps its old =Cluster= (a =Direct= binding never calls
+     =get_conn= again), and a shut-down cluster counts as ready.
+6. *Suggested fix* (break at least one edge):
+   - Don't wait for readiness while holding server connections: in
+     =cluster_check=, skip =wait_ready= when the backend is connected or the
+     client is in a transaction (readiness was checked at =BEGIN=), or wait
+     only on the cluster the transaction started on.
+   - Don't move a transaction to a new cluster silently: after =safe_reload=
+     in =get_conn=, either wait for readiness before checking out (holding
+     nothing), or fail the statement with a retryable error.
+   - Give internal work its own connections: have the schema loader (and
+     =Oids::load=) use a standalone connection like the health check, or a
+     priority checkout, and don't re-queue at the tail after a timeout.
+   - Bound =wait_ready= with a finite timeout and return an error on expiry.
+   *Regression test:* the pool-size-1 sequence above as an integration test:
+   B's second statement must complete (or fail) within a few seconds.
+
+** F7: A txn that grows from one shard to several can deadlock with another txn on the pools; one client is killed after =checkout_timeout=
+Found in M2 at =7523f83= (PgDog v0.1.65), no faults needed.
+1. *Claims:* availability of single-shard and cross-shard txns; not a
+   safety violation (Elle, lost-appends and placement were valid throughout).
+2. *Severity:* liveness / availability. Under contention the deadlocks
+   repeat: up to 145 =FATAL: checkout timeout= disconnects in 120 s and
+   throughput down to 4% of the control (RC). Clients see an unexpected
+   =FATAL 58000= and lose their connection; each stall holds row locks for
+   =checkout_timeout= (5 s).
+3. *Reproducer:* =bash integration/jepsen/repro/sharded.sh setup= then
+   =... checkout-deadlock=. Pool size 1 per shard. A: =BEGIN; SELECT v FROM
+   append WHERE k = 1= (shard 0). B: =BEGIN; SELECT v FROM append WHERE k =
+   1000001= (shard 1). Both then send =SELECT v FROM append WHERE sk = ...=
+   (no shard key, so broadcast). Both block; after 6.0 s PgDog sends B
+   =FATAL: checkout timeout= and drops it, and only then does A proceed.
+   Jepsen: =-w append --mode sharded --read-by sk --concurrency 20 --rate 1000=,
+   any isolation level.
+4. *Evidence:* no-fault runs with reads by sk:
+   SER 73 checkout timeouts, 22k ok vs 83k for the control
+   (=pgdog-sharded-append-serializable-read-sk-c20-t120/2026-11-20T09:36:02=);
+   RR 104, 24k vs 80k; RC 145, 2.7k vs 75k
+   (=...-read-committed-read-sk-c20-t120/2026-11-20T09:46:47=); re-run with
+   the unqualified builder: =...-serializable-read-sk-c20-t120/2026-11-20T10:38:33=. The same
+   reads with =SET TRANSACTION= first (every txn takes all shards up front,
+   in shard order): 0 timeouts, 53k (SER) and 43k (RC) ok
+   (=...-serializable-set-txn-read-sk-c20-t120/2026-11-20T10:41:09=,
+   =...-read-committed-set-txn-read-sk-c20-t120/2026-11-20T10:43:47=).
+5. *Root cause:* =MultiShardUpgrade::upgrade=
+   (=backend/pool/connection/multi_shard/upgrade.rs:27-90=) keeps the txn's
+   current server checked out while =get_conns_for_shards=
+   (=cluster_connection.rs:95-118=) checks out each missing shard in turn, each
+   waiting up to =checkout_timeout=. Two txns that started on different shards
+   and both need the other's shard wait for each other (hold-and-wait across
+   pools, acquired in different orders). =get_conns= for =Shard::All= from
+   an empty binding goes in shard order, which is why =SET TRANSACTION= txns
+   don't deadlock among themselves. Inside a txn a checkout failure is not
+   recoverable (=frontend/client/query_engine/connect.rs:72-98=): the client
+   gets =FATAL 58000= and is disconnected. Any statement that broadcasts
+   inside a txn triggers this: reads without a shard key, =SAVEPOINT= /
+   =RELEASE= / =ROLLBACK TO=, =SET TRANSACTION=, and catalog queries routed to
+   the sticky shard (N2).
+6. *Suggested fix:* the held server can't be released once the txn has used
+   it, so the options are: on an upgrade checkout timeout inside a txn,
+   return an ordinary =ERROR= (txn aborted, client connection kept) instead
+   of a =FATAL= disconnect, with a shorter, separate upgrade timeout; and/or
+   detect the wait-for cycle and fail one side immediately. Avoiding the
+   upgrade where possible also helps: route =SAVEPOINT= / =RELEASE= /
+   =ROLLBACK TO= / =SET TRANSACTION= and catalog reads to the shards the txn
+   already holds (N1, N2). At minimum
+   document that mixing direct and broadcast statements in one txn can stall
+   for =checkout_timeout= under load.
+   *Regression test:* the two-client sequence above with =default_pool_size = 1=:
+   both txns must complete (or one must get a non-fatal error) well before
+   =checkout_timeout=.
+
+** N1: Isolation and savepoint statements turn every txn into an all-shard txn
+Design note for the report (not a correctness bug). =SET TRANSACTION ...=,
+=SET SESSION CHARACTERISTICS ...=, =SAVEPOINT=, =RELEASE= and =ROLLBACK TO=
+route to every shard (=router/parser/query/set.rs:19-24=,
+=query/transaction.rs:25-29, 58-66=). pgjdbc's usual pattern
+(=setAutoCommit(false)=, then =SET TRANSACTION ISOLATION LEVEL=) therefore
+opens and commits a txn on every shard: 2.99 Postgres txns per client txn in
+M2, against 0.98 with =BEGIN ISOLATION LEVEL ...=. Isolation stays correct.
+Costs: a server connection per shard for the whole txn; a fault on any
+shard fails the txn; F7 exposure; and with =two_phase_commit= on, every
+write txn would take the 2PC path (=connected_servers() > 1=,
+=end_transaction.rs:76-80=), which matters for M3. Suggest: route these
+statements to the shards the txn is already bound to, or buffer and replay
+them like =BEGIN=; and document how to keep a txn direct-to-shard.
+
+** N2: Driver metadata queries join the client's sticky shard to the txn
+Design note for the report. With next.jdbc's default row builder, pgjdbc's
+=ResultSetMetaData.getTableName= runs a =pg_catalog= query on the same
+connection, inside the txn. PgDog routes catalog queries to the client's
+sticky shard (=system_catalogs = omnisharded_sticky=, =select.rs:270-293=,
+=sticky.rs:52=), so the txn joins that shard: =BEGIN ISOLATION LEVEL ...= is
+replayed there and the txn commits there. Table OIDs differ per shard, so
+pgjdbc's metadata cache keeps missing and the lookup repeats. Effects in M2:
+1.07–1.26 Postgres txns per client txn instead of 0.98, and a backend fault
+on an unrelated shard aborting txns (2 of 3 "unexplained" lost connections
+in the terminate/kill-backend runs; none once the harness stopped the
+lookups). With 2PC on, these txns would go through 2PC. Any JDBC stack that
+reads result-set metadata (ORMs, generic mappers) behaves this way.
+Suggest: route catalog reads inside a txn to a shard the txn already holds;
+document it. Investigated with run
+=pgdog-sharded-append-serializable-c20-t120-terminate-backend/2026-11-20T09:08:59=.
+
 * Results
 | Claim | Config | Nemesis | Outcome | Run (store path) | Finding # |
 |-------+--------+---------+---------+------------------+-----------|
@@ -932,6 +1252,18 @@ Found at =f8738bda0d41= (same PgDog source as F1–F4).
 | C1 | append SER, RR, 4 tables, mixed paths, mwpk 8 | every M1 + backend fault, 20 s, 240 s | holds (2/2 valid) | =matrix-20261120T020512.tsv= rows 22, 23 | |
 | C1 | F1 contention sweep: keys, clients, pool size, run length | none | *bug* in 14/14 (isolation-checker); Elle 10/14 | =matrix-20261120T031852.tsv= | F1 |
 | — | pool recovery (=SHOW POOLS= drains after the run) | every M1b run | holds | =:pools= in each =results.edn= | (H11 open) |
+| C3 | sharded append SER/RR (+control), BEGIN mode, list mapping; per-shard Elle at strong models | none | holds (4/4 valid; placement, lost, isolation clean) | =matrix-20261120T080815.tsv= rows 1–4 | |
+| C3 | same, RC (+control), smaller runs so Elle finishes | none; all backend faults | holds (4/4) | =matrix-20261120T105925.tsv= rows 1, 2, 5, 6 | |
+| C3 | hash and range placement; simple protocol; =prepareThreshold=1= | none | holds (4/4) | =matrix-20261120T080815.tsv= rows 7, 8, 10, 11 | |
+| C3 | =SET TRANSACTION= mode (every txn fans out to all shards) | none; kill/pause-postgres | holds (2/2), 2.99 xacts/txn | rows 9, 30 | N1 |
+| C3 | SER (+control for faults outside PgDog) | each M1, M1b and shard fault, one per run (18 runs) | holds (safety 18/18) | rows 12–29 | F6 (admin), N2 |
+| C3 | SER, RR, mixed paths, 4 tables | every fault, 20 s | holds (2/2); low throughput from long PgDog outages | rows 31, 32 | |
+| C3 | reads by sk (broadcast inside a single-shard txn), SER/RR/RC (+control) | none; SER all backend faults | safety holds (8/8); *liveness*: 73–145 checkout timeouts per 120 s, RC throughput 4% of control | rows 33–40 | F7 |
+| C3 | UPDATE/INSERT with savepoints, SER/RR/RC (+control) | none | holds (6/6), 1.8 xacts/txn | rows 41–46 | N1 |
+| C2/C1 | session isolation via JDBC with neighbors, sharded (+control) | none | *bug*: 47 txns at the wrong level; control valid | rows 47, 48 | F1 |
+| C3 | follow-ups with no driver catalog queries | none; terminate/kill-backend; pause-pool | holds; 0.98 xacts/txn; a shard fault reaches no txn on another shard | =matrix-20261120T102007.tsv= rows 1–4 | N2 |
+| — | =RELOAD= / =RECONNECT= under load, sharded | admin | *bug*: shard's pool deadlocked until =RECONNECT=, 2 of 4 runs; deterministic repro | =...-admin/2026-11-20T08:48:07=, =.../10:30:47=; =repro/sharded.sh reload-wedge= | F6 |
+| — | broadcast inside a txn bound to another shard | none | *bug* (liveness): cross-pool deadlock, client killed after =checkout_timeout=; deterministic repro | =repro/sharded.sh checkout-deadlock=; =matrix-20261120T102007.tsv= rows 8–10 | F7 |
 
 * Open questions
 - Which edition/version is in scope? Some features (e.g. automatic

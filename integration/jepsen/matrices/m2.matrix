@@ -1,0 +1,89 @@
+# M2: sharded, direct-to-shard (C3). PgDog on n1/n2 (pool_size 4 per
+# shard), Postgres shards on n3/n4/n5. One Elle generator per shard: every
+# txn's keys are on one shard, and Elle checks each shard's sub-history on its
+# own at the strong models (strict-serializable at SER,
+# strong-snapshot-isolation at RR). --control connects straight to the txn's
+# shard.
+#
+# Defaults in sharded mode: --sharding list ([[sharded_tables.mapping]]
+# values), --isolation-mode begin (BEGIN ISOLATION LEVEL ... with autocommit
+# on). That is the only way a txn stays on one shard: PgDog routes
+# SET TRANSACTION / SET SESSION CHARACTERISTICS, SAVEPOINT / RELEASE /
+# ROLLBACK TO, and reads by sk to every shard. The placement checker shows
+# the fan-out as xacts/txn (Postgres txns over all shards per client txn).
+#
+# Backend faults hit a random shard per op. Default COMMIT error
+# classification (58000 on COMMIT is :info; see F5).
+
+# --- No faults, all three isolation levels ---
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 120
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 120 --control
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 120
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 120 --control
+--mode sharded -w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 120
+--mode sharded -w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 120 --control
+
+# --- Placement: hash (PgDog's default hasher) and range mappings ---
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --sharding hash
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --sharding range
+
+# --- How the txn sets its isolation level: SET TRANSACTION (every txn fans
+# out to all shards) ---
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --isolation-mode txn
+
+# --- Protocol variants ---
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --query-mode simple
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --prepare-threshold 1
+
+# --- One fault per run, SER (+control for faults outside PgDog) ---
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-pgdog
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis pause-pgdog
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis partition-clients
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis partition-clients --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis admin
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis pause-pool
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis partition
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis partition --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-postgres
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-postgres --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis pause-postgres
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis pause-postgres --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis terminate-backend --nemesis-interval 3
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis terminate-backend --nemesis-interval 3 --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-backend --nemesis-interval 8
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-backend --nemesis-interval 8 --control
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis restart-postgres --nemesis-interval 15
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis restart-postgres --nemesis-interval 15 --control
+
+# --- SET TRANSACTION under shard faults: a fault on any shard reaches every
+# txn (compare availability with the begin-mode rows above) ---
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --isolation-mode txn --nemesis kill-postgres,pause-postgres
+
+# --- Every fault, 20 s interval, mixed write/read paths ---
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 240 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --list-size 40000 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition,kill-postgres,pause-postgres,terminate-backend,kill-backend,restart-postgres
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 240 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --list-size 40000 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition,kill-postgres,pause-postgres,terminate-backend,kill-backend,restart-postgres
+
+# --- Cross-shard read path: reads by sk are broadcast to every shard and
+# merged. Tracked separately from the direct-to-shard rows. ---
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 120 --read-by sk
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 120 --read-by sk --control
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 120 --read-by sk
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 120 --read-by sk --control
+--mode sharded -w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 120 --read-by sk
+--mode sharded -w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 120 --read-by sk --control
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 180 --read-by sk --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+--mode sharded -w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 180 --read-by sk --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6 --control
+
+# --- UPDATE / INSERT in a SAVEPOINT (SAVEPOINT fans out to every shard),
+# 4 tables, fresh keys ---
+--mode sharded -w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8
+--mode sharded -w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8 --control
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8 --control
+--mode sharded -w append --isolation read-committed  --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8
+--mode sharded -w append --isolation read-committed  --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --max-writes-per-key 8 --control
+
+# --- F1 in sharded mode: session isolation via JDBC with neighbors. SET
+# SESSION CHARACTERISTICS goes to every shard, untracked. ---
+--mode sharded -w append --concurrency 10 --time-limit 60 --isolation-mode session --neighbors
+--mode sharded -w append --concurrency 10 --time-limit 60 --isolation-mode session --neighbors --control

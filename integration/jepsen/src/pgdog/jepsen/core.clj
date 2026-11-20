@@ -79,6 +79,14 @@
       (nc/compose-packages pkgs)
       (nc/nemesis-package (assoc base :faults #{})))))
 
+(defn default-isolation-mode
+  "How txns set their isolation level unless --isolation-mode says
+  otherwise: SET TRANSACTION in pooler mode (M1), BEGIN ISOLATION LEVEL in
+  sharded mode, the only way a txn stays on one shard (see
+  client/run-txn!)."
+  [opts]
+  (if (= :sharded (:mode opts)) :begin :txn))
+
 (defn test-name
   "Store directory name, so no spaces. Options at their defaults are left out."
   [opts]
@@ -91,14 +99,24 @@
                    (not= session-leak/mechanisms (:session-mechanisms opts)))
               (conj (str/join "+" (map name (:session-mechanisms opts))))
 
-              (and (= :append (:workload opts)) (= :session (:isolation-mode opts)))
-              (conj "session-iso")
+              (and (= :sharded (:mode opts)) (not= :list (:sharding opts)))
+              (conj (name (:sharding opts)))
+
+              (and (= :append (:workload opts))
+                   (not= (default-isolation-mode opts) (:isolation-mode opts)))
+              (conj (case (:isolation-mode opts)
+                      :session "session-iso"
+                      :txn     "set-txn"
+                      :begin   "begin-iso"))
 
               (not= 1 (:tables opts))
               (conj (str "tables" (:tables opts)))
 
               (not= :upsert (:append-path opts))
               (conj (name (:append-path opts)))
+
+              (not= :unqualified (:jdbc-builder opts))
+              (conj (str "jdbc-" (name (:jdbc-builder opts))))
 
               (not= :pk (:read-by opts))
               (conj (str "read-" (name (:read-by opts))))
@@ -153,14 +171,16 @@
         db       (db/db)
         workload ((workloads (:workload opts)) opts)
         pkg      (nemesis-package opts db)
-        wrap     (or (:wrap-generator workload) identity)]
+        wrap     (or (:wrap-generator workload) identity)
+        sharded? (and (= :sharded (:mode opts)) (= :append (:workload opts)))]
     (merge tests/noop-test
            opts
            {:name      (test-name opts)
             :os        debian/os
             :db        db
             :client    (role/restrict-client :pgdog (:client workload))
-            :nemesis   (n/compose [(:nemesis pkg) (pn/pool-stats-nemesis)])
+            :nemesis   (n/compose [(:nemesis pkg) (pn/pool-stats-nemesis)
+                                   (pn/shard-dump-nemesis)])
             :checker   (checker/compose
                          {:perf       (checker/perf {:nemeses (:perf pkg)})
                           :stats      (checker/stats)
@@ -170,6 +190,9 @@
                           :workload   (:checker workload)})
             :generator (wrap
                          (gen/phases
+                           (if sharded?
+                             (gen/nemesis {:type :info, :f :xact-stats, :value nil})
+                             [])
                            (->> (:generator workload)
                                 (gen/stagger (/ (:rate opts)))
                                 (gen/nemesis (:generator pkg))
@@ -179,6 +202,10 @@
                            (gen/log "Waiting for recovery")
                            (gen/sleep (:recovery-time opts))
                            (gen/clients (:final-generator workload))
+                           (if sharded?
+                             (gen/phases (gen/log "Reading every shard directly")
+                                         (gen/nemesis {:type :info, :f :shard-dump, :value nil}))
+                             [])
                            (gen/log "Checking that pools drained")
                            (gen/nemesis {:type :info, :f :pool-stats, :value nil})))})))
 
@@ -202,8 +229,25 @@
     :default 2
     :parse-fn parse-long]
 
-   [nil "--control" "Bypass PgDog: clients connect straight to Postgres (pooler mode only)"
+   [nil "--control" "Bypass PgDog: clients connect straight to Postgres (in sharded mode, to the txn's shard)"
     :default false]
+
+   [nil "--sharding KIND" (str "sharded mode: how PgDog places keys. list ([[sharded_tables.mapping]] values), "
+                               "range (mapping start/end), or hash (PgDog's default hasher)")
+    :default :list
+    :parse-fn keyword
+    :validate [#{:list :range :hash} "must be list, range or hash"]]
+
+   [nil "--jdbc-builder KIND" (str "next.jdbc row builder: unqualified (column labels only) or qualified "
+                                   "(next.jdbc's default; pgjdbc runs pg_catalog lookups inside the txn, which PgDog "
+                                   "routes to the client's sticky shard)")
+    :default :unqualified
+    :parse-fn keyword
+    :validate [#{:unqualified :qualified} "must be unqualified or qualified"]]
+
+   [nil "--list-size N" "--sharding list: keys listed per shard; a run that needs more fails"
+    :default 20000
+    :parse-fn parse-long]
 
    [nil "--isolation LEVEL" "serializable, repeatable-read or read-committed"
     :default :serializable
@@ -244,10 +288,11 @@
     :validate [#(try (cm/anomalies-prohibited-by %) true (catch Exception _ false))
                "unknown Elle consistency model"]]
 
-   [nil "--isolation-mode MODE" "txn: SET TRANSACTION per txn; session: JDBC setTransactionIsolation"
-    :default :txn
+   [nil "--isolation-mode MODE" (str "txn: SET TRANSACTION per txn; session: JDBC setTransactionIsolation; "
+                                     "begin: BEGIN ISOLATION LEVEL with autocommit on. "
+                                     "Default: txn in pooler mode, begin in sharded mode")
     :parse-fn keyword
-    :validate [#{:txn :session} "must be txn or session"]]
+    :validate [#{:txn :session :begin} "must be txn, session or begin"]]
 
    [nil "--query-mode MODE" "pgjdbc preferQueryMode: extended or simple"
     :default :extended
@@ -323,6 +368,7 @@
   "Fills in defaults the stock Jepsen CLI doesn't know about."
   [opts]
   (-> opts
+      (update :isolation-mode #(or % (default-isolation-mode opts)))
       (update-in [:ssh :private-key-path]
                  #(or % (str (System/getProperty "user.home") "/.ssh/id_jepsen")))
       pgdog-test))
@@ -339,5 +385,8 @@
                                            "Elle's per-anomaly cycle search budget (Elle default 1000)"
                                            :parse-fn parse-long]]
                                :usage    "Usage: lein run recheck [--consistency-models LIST] [--cycle-search-timeout MS] STORE_DIR..."
-                               :run      recheck/run-cmd!}})
+                               :run      recheck/run-cmd!}
+                    "reanalyze" {:opt-spec []
+                                 :usage    "Usage: lein run reanalyze STORE_DIR... (re-runs the backends/isolation/lost/placement checkers)"
+                                 :run      recheck/reanalyze-cmd!}})
             args))

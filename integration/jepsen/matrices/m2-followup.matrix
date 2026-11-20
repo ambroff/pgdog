@@ -1,0 +1,23 @@
+# M2 follow-ups. Default --jdbc-builder is now unqualified (no pgjdbc
+# catalog lookups inside txns), so begin-mode pk txns stay on one shard.
+
+# Direct-to-shard with no hidden fan-out: xacts/txn should be ~1.0, and a
+# backend fault on one shard should reach no txn on another.
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis terminate-backend --nemesis-interval 3
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-backend --nemesis-interval 8
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis pause-pool
+
+# F6: RELOAD/RECONNECT under load, with and without the catalog-lookup fan-out.
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis admin
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis admin
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis admin --jdbc-builder qualified
+
+# L1: reads by sk. SET TRANSACTION mode takes every shard up front, in shard
+# order; begin mode takes the home shard first, then the rest.
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --read-by sk
+--mode sharded -w append --concurrency 20 --rate 1000 --time-limit 120 --read-by sk --isolation-mode txn
+--mode sharded -w append --isolation read-committed --concurrency 20 --rate 1000 --time-limit 120 --read-by sk --isolation-mode txn
+
+# The all-faults RR collapse (1705 ok in 240 s), again
+--mode sharded -w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 240 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --list-size 40000 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition,kill-postgres,pause-postgres,terminate-backend,kill-backend,restart-postgres

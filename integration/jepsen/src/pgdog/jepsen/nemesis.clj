@@ -15,16 +15,19 @@
                     [util :refer [meh]]]
             [jepsen.control.util :as cu]
             [jepsen.random :as rand]
+            [next.jdbc :as j]
+            [next.jdbc.result-set :as rs]
             [pgdog.jepsen.client :as pc]
             [pgdog.jepsen.db :as db]))
 
 (defn client-targets
-  "The nodes clients connect to, and the port: PgDog nodes, or the Postgres
-  node with --control."
+  "The nodes clients connect to, and the port: PgDog nodes, or with --control
+  the Postgres node (every shard in sharded mode)."
   [test]
-  (if (:control test)
-    [(vec (take 1 (role/nodes test :postgres))) db/pg-port]
-    [(role/nodes test :pgdog) db/pgdog-port]))
+  (cond
+    (not (:control test))     [(role/nodes test :pgdog) db/pgdog-port]
+    (= :sharded (:mode test)) [(role/nodes test :postgres) db/pg-port]
+    :else                     [(vec (take 1 (role/nodes test :postgres))) db/pg-port]))
 
 (defn pick
   "Resolves a target spec (:one or :all) against `nodes`."
@@ -220,36 +223,45 @@
        (when (:control test) " AND application_name = 'jepsen'")
        (when (= :one spec) " ORDER BY state = 'idle', random() LIMIT 1")))
 
-(defn parse-backends [rows]
+(defn parse-backends [node rows]
   (mapv (fn [[pid addr state xid result]]
-          (cond-> {:pid         (parse-long pid)
+          (cond-> {:node        node
+                   :pid         (parse-long pid)
                    :client-addr addr
                    :state       state}
             (seq xid)           (assoc :xid xid)
             (= "f" result)      (assoc :terminated? false)))
         rows))
 
+(defn fault-node
+  "The Postgres node a backend fault hits: a random shard in sharded mode,
+  the only Postgres in pooler mode."
+  [test]
+  (rand/nth (role/nodes test :postgres)))
+
 (defn terminate-backends!
-  "pg_terminate_backend on one or all of the workload's backends. Each gets
-  FATAL 57P01 and its connection closes."
-  [test spec]
-  (let [pg (first (role/nodes test :postgres))]
+  "pg_terminate_backend on one or all of the workload's backends on `pg`.
+  Each gets FATAL 57P01 and its connection closes."
+  [test pg spec]
+  (do
     (c/on-nodes test [pg]
-                (fn [_ _]
+                (fn [_ node]
                   (parse-backends
+                    node
                     (db/psql-rows! db/database
                                    (format (backends-sql test spec)
                                            "pg_terminate_backend(pid)")))))))
 
 (defn kill-backend!
-  "SIGKILLs one of the workload's backends. The postmaster then treats it as
-  a crash: it kills every other backend (they get 57P02 or just EOF), runs
-  crash recovery and accepts connections again."
-  [test]
-  (let [pg (first (role/nodes test :postgres))]
+  "SIGKILLs one of the workload's backends on `pg`. The postmaster then
+  treats it as a crash: it kills every other backend (they get 57P02 or just
+  EOF), runs crash recovery and accepts connections again."
+  [test pg]
+  (do
     (c/on-nodes test [pg]
-                (fn [_ _]
+                (fn [_ node]
                   (let [backends (parse-backends
+                                   node
                                    (db/psql-rows! db/database
                                                   (format (backends-sql test :one) "'t'")))]
                     (c/su (doseq [{:keys [pid]} backends]
@@ -275,32 +287,33 @@
       ;; terminate/kill look up backends with psql, which Postgres refuses
       ;; while it is still in crash recovery from a previous fault. That hits
       ;; nothing; record it rather than crash the op.
-      (letfn [(skipped [e]
-                (assoc op :value {:spec value, :backends [], :skipped (.getMessage ^Throwable e)}))]
-        (case f
-          :terminate-backend
-          (try
-            (let [hit (terminate-backends! test value)]
-              (assoc op :value {:spec value, :backends (vec (mapcat val hit))}))
-            (catch Exception e (skipped e)))
+      (let [pg (fault-node test)]
+        (letfn [(skipped [e]
+                  (assoc op :value {:spec value, :node pg, :backends [],
+                                    :skipped (.getMessage ^Throwable e)}))]
+          (case f
+            :terminate-backend
+            (try
+              (let [hit (terminate-backends! test pg value)]
+                (assoc op :value {:spec value, :node pg, :backends (vec (mapcat val hit))}))
+              (catch Exception e (skipped e)))
 
-          :kill-backend
-          (try
-            (let [hit (kill-backend! test)]
-              (assoc op :value {:backends (vec (mapcat val hit))}))
-            (catch Exception e (skipped e)))
+            :kill-backend
+            (try
+              (let [hit (kill-backend! test pg)]
+                (assoc op :value {:node pg, :backends (vec (mapcat val hit))}))
+              (catch Exception e (skipped e)))
 
-        :restart-postgres
-        (let [pg (first (role/nodes test :postgres))]
-          (c/on-nodes test [pg] (fn [t _] (db/restart-immediate! t value)))
-          (assoc op :value {:down-ms value, :node pg}))
+            :restart-postgres
+            (do (c/on-nodes test [pg] (fn [t _] (db/restart-immediate! t value)))
+                (assoc op :value {:down-ms value, :node pg}))
 
-        ;; Final heal: make sure Postgres is up even if a restart failed
-        ;; halfway (stopped, then the start errored).
-        :start-postgres
-        (let [pg (first (role/nodes test :postgres))]
-          (c/on-nodes test [pg] (fn [t _] (db/ensure-started! t)))
-          (assoc op :value :started)))))
+            ;; Final heal: make sure every Postgres is up even if a restart
+            ;; failed halfway (stopped, then the start errored).
+            :start-postgres
+            (do (c/on-nodes test (role/nodes test :postgres)
+                            (fn [t _] (db/ensure-started! t)))
+                (assoc op :value :started))))))
 
     (teardown! [_ test])))
 
@@ -338,7 +351,7 @@
   (->> (pc/admin! node "SHOW POOLS")
        (map (fn [row] (into {} (map (fn [[k v]] [(keyword (name k)) v])) row)))
        (filter #(and (= db/database (:database %)) (= db/user (:user %))))
-       (mapv (fn [r] (-> (select-keys r [:addr :cl_waiting :sv_idle :sv_active
+       (mapv (fn [r] (-> (select-keys r [:addr :shard :cl_waiting :sv_idle :sv_active
                                          :sv_idle_xact :sv_total :errors
                                          :force_closed :healthy])
                          (update :cl_waiting ->long) (update :sv_idle ->long)
@@ -386,5 +399,65 @@
         (assoc op :value (into (sorted-map)
                                (map (fn [node] [node (pool-stats! node 15000)]))
                                (role/nodes test :pgdog)))))
+
+    (teardown! [_ test])))
+
+;; ---------------------------------------------------------------------------
+;; Direct reads of every shard (sharded mode): ground truth for placement
+
+(defn direct-conn
+  "A JDBC connection straight to Postgres on `node`, bypassing PgDog."
+  [node]
+  (j/get-connection {:dbtype         "postgresql"
+                     :host           node
+                     :port           db/pg-port
+                     :dbname         db/database
+                     :user           db/user
+                     :password       db/password
+                     :connectTimeout 5
+                     :socketTimeout  60}))
+
+(defn xacts
+  "Committed plus rolled-back txns in the jepsen database, from
+  pg_stat_database."
+  [conn]
+  (some-> (j/execute-one! conn [(str "SELECT (xact_commit + xact_rollback)::bigint AS n "
+                                     "FROM pg_stat_database WHERE datname = ?")
+                                db/database])
+          :n))
+
+(defn shard-dump!
+  "{node {:shard s, :xacts n, :rows [[k v] ...]}} over every Postgres node,
+  read directly. With rows? false, only the txn counts. A node that can't be
+  read reports the error instead."
+  [test rows?]
+  (into (sorted-map)
+        (for [node (role/nodes test :postgres)]
+          [node
+           (try
+             (with-open [^java.sql.Connection conn (direct-conn node)]
+               (cond-> {:shard (db/shard-index test node)
+                        :xacts (xacts conn)}
+                 rows?
+                 (assoc :rows (vec (for [t   (db/append-tables test)
+                                         row (j/execute! conn [(str "SELECT k, v FROM " t " ORDER BY k")]
+                                                         {:builder-fn rs/as-unqualified-maps})]
+                                     [(:k row) (:v row)])))))
+             (catch Exception e
+               {:error (.getMessage e)}))])))
+
+(defn shard-dump-nemesis
+  "{:f :xact-stats} records each shard's txn count; {:f :shard-dump} also
+  reads every row. Sharded mode only; see client/placement-checker."
+  []
+  (reify
+    n/Reflection
+    (fs [_] [:xact-stats :shard-dump])
+
+    n/Nemesis
+    (setup! [this test] this)
+
+    (invoke! [_ test {:keys [f] :as op}]
+      (assoc op :value (shard-dump! test (= :shard-dump f))))
 
     (teardown! [_ test])))
