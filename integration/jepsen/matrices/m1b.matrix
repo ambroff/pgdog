@@ -1,0 +1,56 @@
+# M1b: plain pooler (one Postgres on n3, PgDog on n1/n2, pool_size 4 each),
+# server-side faults and the follow-ups from Jepsen's PostgreSQL 12.3
+# analysis. Elle checks the strong models by default in pooler mode
+# (strict-serializable at SER, strong-snapshot-isolation at RR). Every
+# config also runs with --control (straight to Postgres), where the backend
+# faults hit the Jepsen clients' own backends.
+#
+# Backend faults: terminate-backend (pg_terminate_backend on one busy or all
+# backends), kill-backend (SIGKILL one backend -> postmaster crash restart),
+# restart-postgres (pg_ctl stop -m immediate, down 0/2/7 s, start). 20
+# clients at ~1000 txn/s so backends are often mid-transaction.
+
+# --- Backend faults, one per run, SER ---
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis terminate-backend --nemesis-interval 3
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis terminate-backend --nemesis-interval 3 --control
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-backend --nemesis-interval 8
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis kill-backend --nemesis-interval 8 --control
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis restart-postgres --nemesis-interval 15
+-w append --concurrency 20 --rate 1000 --time-limit 120 --nemesis restart-postgres --nemesis-interval 15 --control
+
+# --- RR and RC, all backend faults ---
+-w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+-w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6 --control
+-w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+-w append --isolation read-committed  --concurrency 20 --rate 1000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6 --control
+
+# --- Protocol variants, all backend faults (named prepared statements must
+# be re-prepared on replacement server connections) ---
+-w append --concurrency 20 --rate 1000 --time-limit 180 --query-mode simple    --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+-w append --concurrency 20 --rate 1000 --time-limit 180 --prepare-threshold 1  --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+
+# --- H4 probe: every non-connection error on COMMIT counted as a definite
+# abort. PgDog reports a lost server connection as FATAL 58000, not 08xxx;
+# if such a COMMIT actually committed, Elle reports G1a. ---
+-w append --concurrency 20 --rate 1000 --time-limit 180 --strict-commit-errors --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 4
+-w append --concurrency 20 --rate 1000 --time-limit 180 --strict-commit-errors --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 4 --control
+
+# --- C2: session state after server connections are replaced (tracked
+# mechanisms only; F1-F3 cover the untracked ones) ---
+-w session-leak --concurrency 20 --time-limit 180 --session-mechanisms reset,set,startup --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6
+-w session-leak --concurrency 20 --time-limit 180 --session-mechanisms reset,set,startup --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 6 --control
+
+# --- Write and read paths, fresh inserts (4 tables, UPDATE/INSERT/SAVEPOINT
+# appends, reads by unindexed secondary key, keys retired after 8 writes) ---
+-w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8
+-w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8 --control
+-w append --isolation repeatable-read --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8
+-w append --isolation repeatable-read --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8 --control
+-w append --isolation read-committed  --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8
+-w append --isolation read-committed  --concurrency 20 --time-limit 120 --tables 4 --append-path update-insert --read-by sk --max-writes-per-key 8 --control
+-w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --prepare-threshold 1
+-w append --isolation serializable    --concurrency 20 --time-limit 120 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --query-mode simple
+
+# --- Write and read paths under every fault (M1 faults + backend faults) ---
+-w append --isolation serializable    --concurrency 20 --rate 1000 --time-limit 240 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition,terminate-backend,kill-backend,restart-postgres
+-w append --isolation repeatable-read --concurrency 20 --rate 1000 --time-limit 240 --tables 4 --append-path mixed --read-by mixed --max-writes-per-key 8 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition,terminate-backend,kill-backend,restart-postgres

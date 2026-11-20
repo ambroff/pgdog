@@ -34,6 +34,33 @@
 (defn pg-log [test]
   (str "/var/log/postgresql/postgresql-" (:pg-version test) "-main.log"))
 
+(defn ensure-started!
+  "Starts Postgres if it isn't running and waits for its port. Retries: right
+  after an immediate stop, systemd may not have noticed the postmaster exit
+  yet and treat start as a no-op."
+  [test]
+  (c/su
+    (loop [tries 5]
+      (meh (c/exec :systemctl :reset-failed (pg-unit test)))
+      (meh (c/exec :systemctl :start (pg-unit test)))
+      (let [up? (try (cu/await-tcp-port pg-port {:timeout 15000}) true
+                     (catch Exception _ false))]
+        (when-not up?
+          (if (pos? tries)
+            (do (Thread/sleep 1000) (recur (dec tries)))
+            (throw (IllegalStateException. "Postgres did not come back up"))))))))
+
+(defn restart-immediate!
+  "pg_ctl stop -m immediate (every backend is killed without a checkpoint),
+  waits `down-ms`, then starts Postgres again, which runs crash recovery.
+  Stopping outside systemd leaves the unit failed; start clears that."
+  [test down-ms]
+  (c/su
+    (c/exec :pg_ctlcluster :--skip-systemctl-redirect (:pg-version test) "main"
+            :stop :-m :immediate)
+    (when (pos? down-ms) (Thread/sleep (long down-ms)))
+    (ensure-started! test)))
+
 (defn psql!
   "Runs SQL as the postgres superuser against the given database."
   ([sql] (psql! "postgres" sql))
@@ -51,11 +78,35 @@
       (c/exec "/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh" :-y)
       (debian/install [pkg]))))
 
+(defn psql-rows!
+  "Runs a query as the postgres superuser and returns its rows as vectors of
+  strings (psql unaligned, tab-separated)."
+  [db sql]
+  (let [out (c/cd "/tmp"
+              (c/sudo "postgres"
+                (c/exec :psql :-v "ON_ERROR_STOP=1" :-d db :-At :-F "\t" :-c sql)))]
+    (->> (str/split-lines out)
+         (remove str/blank?)
+         (mapv #(str/split % #"\t" -1)))))
+
+(defn append-tables
+  "Table names for the append workload. One table keeps M1's name, `append`;
+  --tables N spreads keys over append_0 .. append_<N-1>."
+  [test]
+  (let [n (:tables test 1)]
+    (if (= 1 n)
+      ["append"]
+      (mapv #(str "append_" %) (range n)))))
+
 (defn schema
   "DDL for every workload. Kept here (not in clients) so it is applied directly
-  on each Postgres node, independent of PgDog's DDL routing."
-  []
-  ["CREATE TABLE IF NOT EXISTS append (k bigint PRIMARY KEY, v text NOT NULL)"])
+  on each Postgres node, independent of PgDog's DDL routing. `sk` is a
+  secondary key with no index (always equal to k), for reads that must scan
+  the table (--read-by sk)."
+  [test]
+  (for [t (append-tables test)]
+    (str "CREATE TABLE IF NOT EXISTS " t
+         " (k bigint PRIMARY KEY, sk bigint NOT NULL, v text NOT NULL)")))
 
 (defn configure-postgres!
   [test]
@@ -79,12 +130,12 @@
   (cu/await-tcp-port pg-port {:timeout 60000}))
 
 (defn create-database!
-  []
+  [test]
   (psql! (str "DROP DATABASE IF EXISTS " database " WITH (FORCE)"))
   (psql! (str "DROP ROLE IF EXISTS " user))
   (psql! (str "CREATE ROLE " user " LOGIN PASSWORD '" password "'"))
   (psql! (str "CREATE DATABASE " database " OWNER " user))
-  (doseq [ddl (schema)]
+  (doseq [ddl (schema test)]
     (psql! database (str "SET ROLE " user "; " ddl))))
 
 (defrecord Postgres []
@@ -93,7 +144,7 @@
     (c/su
       (install-postgres! test)
       (configure-postgres! test)
-      (create-database!)))
+      (create-database! test)))
 
   (teardown! [_ test node]
     (c/su
@@ -163,10 +214,11 @@
                         (str "shard = " shard)])
                      pg-nodes))
         sharding (when (= :sharded (:mode test))
-                   [["[[sharded_tables]]"
-                     (str "database = " (toml-str database))
-                     "name = \"append\""
-                     "column = \"k\""]])
+                   (for [t (append-tables test)]
+                     ["[[sharded_tables]]"
+                      (str "database = " (toml-str database))
+                      (str "name = " (toml-str t))
+                      "column = \"k\""]))
         admin    ["[admin]"
                   (str "name = " (toml-str admin-database))
                   (str "user = " (toml-str admin-user))

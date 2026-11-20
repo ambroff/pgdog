@@ -198,3 +198,193 @@
                          :start #{:pause-pool}
                          :stop  #{:resume-pool}
                          :color "#E9C5A0"}}}))
+
+;; ---------------------------------------------------------------------------
+;; Backend faults (Jepsen's PostgreSQL 12.3 analysis killed Postgres processes;
+;; a pooler sees that as dead server connections)
+
+(defn backends-sql
+  "Selects the client backends the workload uses: PgDog's server connections,
+  or the Jepsen clients themselves with --control. Both log in as db/user;
+  with --control PgDog still runs and keeps idle connections, so only the
+  clients' own sessions (application_name jepsen) are picked.
+  With :one, a single backend, preferring one that is running a statement or
+  is inside a transaction: most of the time PgDog's server connections sit
+  idle in the pool, and killing those mostly tests reconnection."
+  [test spec]
+  (str "SELECT pid, coalesce(host(client_addr), ''), state, "
+       "coalesce(backend_xid::text, ''), %s "
+       "FROM pg_stat_activity "
+       "WHERE usename = '" db/user "' AND datname = '" db/database "' "
+       "AND backend_type = 'client backend' AND pid <> pg_backend_pid()"
+       (when (:control test) " AND application_name = 'jepsen'")
+       (when (= :one spec) " ORDER BY state = 'idle', random() LIMIT 1")))
+
+(defn parse-backends [rows]
+  (mapv (fn [[pid addr state xid result]]
+          (cond-> {:pid         (parse-long pid)
+                   :client-addr addr
+                   :state       state}
+            (seq xid)           (assoc :xid xid)
+            (= "f" result)      (assoc :terminated? false)))
+        rows))
+
+(defn terminate-backends!
+  "pg_terminate_backend on one or all of the workload's backends. Each gets
+  FATAL 57P01 and its connection closes."
+  [test spec]
+  (let [pg (first (role/nodes test :postgres))]
+    (c/on-nodes test [pg]
+                (fn [_ _]
+                  (parse-backends
+                    (db/psql-rows! db/database
+                                   (format (backends-sql test spec)
+                                           "pg_terminate_backend(pid)")))))))
+
+(defn kill-backend!
+  "SIGKILLs one of the workload's backends. The postmaster then treats it as
+  a crash: it kills every other backend (they get 57P02 or just EOF), runs
+  crash recovery and accepts connections again."
+  [test]
+  (let [pg (first (role/nodes test :postgres))]
+    (c/on-nodes test [pg]
+                (fn [_ _]
+                  (let [backends (parse-backends
+                                   (db/psql-rows! db/database
+                                                  (format (backends-sql test :one) "'t'")))]
+                    (c/su (doseq [{:keys [pid]} backends]
+                            (meh (c/exec :kill :-9 pid))))
+                    backends)))))
+
+(defn backend-nemesis
+  "Ops:
+    {:f :terminate-backend, :value :one|:all}
+    {:f :kill-backend}
+    {:f :restart-postgres, :value down-ms}   pg_ctl stop -m immediate, start
+  Each completes with the backends it hit, so the backend checker can match
+  client errors to them."
+  []
+  (reify
+    n/Reflection
+    (fs [_] [:terminate-backend :kill-backend :restart-postgres :start-postgres])
+
+    n/Nemesis
+    (setup! [this test] this)
+
+    (invoke! [_ test {:keys [f value] :as op}]
+      ;; terminate/kill look up backends with psql, which Postgres refuses
+      ;; while it is still in crash recovery from a previous fault. That hits
+      ;; nothing; record it rather than crash the op.
+      (letfn [(skipped [e]
+                (assoc op :value {:spec value, :backends [], :skipped (.getMessage ^Throwable e)}))]
+        (case f
+          :terminate-backend
+          (try
+            (let [hit (terminate-backends! test value)]
+              (assoc op :value {:spec value, :backends (vec (mapcat val hit))}))
+            (catch Exception e (skipped e)))
+
+          :kill-backend
+          (try
+            (let [hit (kill-backend! test)]
+              (assoc op :value {:backends (vec (mapcat val hit))}))
+            (catch Exception e (skipped e)))
+
+        :restart-postgres
+        (let [pg (first (role/nodes test :postgres))]
+          (c/on-nodes test [pg] (fn [t _] (db/restart-immediate! t value)))
+          (assoc op :value {:down-ms value, :node pg}))
+
+        ;; Final heal: make sure Postgres is up even if a restart failed
+        ;; halfway (stopped, then the start errored).
+        :start-postgres
+        (let [pg (first (role/nodes test :postgres))]
+          (c/on-nodes test [pg] (fn [t _] (db/ensure-started! t)))
+          (assoc op :value :started)))))
+
+    (teardown! [_ test])))
+
+(def backend-faults
+  "--nemesis names for backend faults, and the op each one generates."
+  {:terminate-backend (fn [] {:f :terminate-backend, :value (rand/nth [:one :one :all])})
+   :kill-backend      (fn [] {:f :kill-backend, :value nil})
+   :restart-postgres  (fn [] {:f :restart-postgres, :value (rand/nth [0 2000 7000])})})
+
+(defn backend-package
+  "Backend faults, one-shot ops staggered by the nemesis interval. `faults`
+  is a subset of the keys of `backend-faults`. These act on the single
+  Postgres (pooler mode); with --control they hit the clients' own backends,
+  which is the baseline."
+  [{:keys [interval faults]}]
+  (let [fs (vec (filter (set faults) (keys backend-faults)))]
+    {:nemesis         (backend-nemesis)
+     :generator       (->> (fn [_ _] (assoc ((backend-faults (rand/nth fs))) :type :info))
+                           (gen/stagger interval))
+     :final-generator {:type :info, :f :start-postgres, :value nil}
+     :perf      #{{:name  "backend"
+                   :fs    #{:terminate-backend :kill-backend :restart-postgres :start-postgres}
+                   :start #{}
+                   :stop  #{}
+                   :color "#E9A0A0"}}}))
+
+;; ---------------------------------------------------------------------------
+;; Pool stats: does every pool drain once the workload is done?
+
+(defn ->long [v] (when (some? v) (long (bigdec (str v)))))
+
+(defn pool-rows
+  "SHOW POOLS rows for the workload's database and user on `node`."
+  [node]
+  (->> (pc/admin! node "SHOW POOLS")
+       (map (fn [row] (into {} (map (fn [[k v]] [(keyword (name k)) v])) row)))
+       (filter #(and (= db/database (:database %)) (= db/user (:user %))))
+       (mapv (fn [r] (-> (select-keys r [:addr :cl_waiting :sv_idle :sv_active
+                                         :sv_idle_xact :sv_total :errors
+                                         :force_closed :healthy])
+                         (update :cl_waiting ->long) (update :sv_idle ->long)
+                         (update :sv_active ->long) (update :sv_idle_xact ->long)
+                         (update :sv_total ->long) (update :errors ->long)
+                         (update :force_closed ->long))))))
+
+(defn drained? [rows]
+  (every? #(and (zero? (:sv_active %)) (zero? (:cl_waiting %))) rows))
+
+(defn pool-stats!
+  "Polls SHOW POOLS on `node` for up to `timeout-ms` until no server
+  connection is checked out and no client is waiting. Clients are idle by
+  now, so in transaction mode every server should be back in the pool. A
+  checked-out count that never drains is a leaked connection slot: the pool
+  has permanently lost capacity."
+  [node timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [rows (try (pool-rows node)
+                      (catch Exception e [:error (.getMessage e)]))]
+        (cond
+          (and (vector? rows) (not= :error (first rows)) (drained? rows))
+          {:drained? true, :pools rows}
+
+          (< (System/currentTimeMillis) deadline)
+          (do (Thread/sleep 500) (recur))
+
+          :else
+          {:drained? false, :pools rows})))))
+
+(defn pool-stats-nemesis
+  "{:f :pool-stats} reports pool-stats! for every PgDog node."
+  []
+  (reify
+    n/Reflection
+    (fs [_] [:pool-stats])
+
+    n/Nemesis
+    (setup! [this test] this)
+
+    (invoke! [_ test op]
+      (if (:control test)
+        (assoc op :value :skipped-control)
+        (assoc op :value (into (sorted-map)
+                               (map (fn [node] [node (pool-stats! node 15000)]))
+                               (role/nodes test :pgdog)))))
+
+    (teardown! [_ test])))

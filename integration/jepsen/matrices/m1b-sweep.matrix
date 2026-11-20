@@ -1,0 +1,20 @@
+# M1b contention sweep for F1: append at SER with isolation set per session
+# through JDBC and READ COMMITTED neighbors on the same pool (--neighbors).
+# Baseline: 10 keys, 10 clients (5 append + 5 neighbors), pool_size 4 per
+# PgDog, 60 s. One factor varies per row. Columns to read: wrong (txns that
+# ran at the wrong level), first-wrong-s (seconds until the first one), and
+# Elle's anomalies, which need a conflicting interleaving on top.
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 10
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 30
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --key-count 3
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --key-count 30
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --key-count 100
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 4  --time-limit 60
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 20 --time-limit 60
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 40 --time-limit 60
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --pool-size 1
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --pool-size 2
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --pool-size 8
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 60 --max-writes-per-key 8
+-w append --isolation serializable --isolation-mode session --neighbors --concurrency 20 --time-limit 30 --key-count 3 --pool-size 1

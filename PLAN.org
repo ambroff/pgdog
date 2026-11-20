@@ -116,6 +116,9 @@ confirms or rules it out.
   G1a (aborted read).
 - Test: the Jepsen client first maps COMMIT errors to =:fail= (definite) by
   SQLSTATE, to surface this. Classify the result afterwards: bug or doc gap.
+- M1b: already true without 2PC. A lost server connection during =COMMIT=
+  reaches the client as =FATAL 58000=, and some of those txns committed
+  (F5). The 2PC form (=end_two_pc=) is still for M3.
 
 ** H5: When 2PC actually kicks in
 - 2PC runs only if =two_pc_enabled() && route.is_write() && !rollback &&
@@ -179,6 +182,29 @@ confirms or rules it out.
 - =RESHARD= cutover is single-node only (=docs/RESHARDING.md:23=). The manual
   =MAINTENANCE ON= / =RELOAD= / =MAINTENANCE OFF= flow is claimed to be atomic
   across containers. Test both.
+
+** H11: A checkout timeout can leak a pool slot for good
+Found by reading the code during M1b. Not reproduced: every M1b pool
+drained.
+- =Inner::put= (=backend/pool/inner.rs:329=) hands a returned connection to
+  the oldest waiter over a oneshot channel and records it in =taken=, under
+  the pool lock. The waiter's checkout timeout can fire on another worker
+  thread after its last poll of the channel came back empty but before
+  =Waiting::drop= (=backend/pool/waiting.rs:13=) takes the lock. The handoff
+  then succeeds, =Waiting::drop= has nothing to remove, and dropping the
+  channel drops the =Server= without a check-in. The =taken= entry is never
+  cleared.
+- Each leak makes =total()= / =full()= one too high, so the pool's usable
+  size shrinks by one. A =RELOAD= that moves connections into the new pool
+  (=Databases::move_conns_to=) carries the leak over; one that rebuilds the
+  pool clears it. Once the leaks reach the pool size and the real
+  connections have died (e.g. at the next Postgres restart), every checkout
+  times out.
+- Test: a tiny =checkout_timeout= with a pool far smaller than the client
+  count, so many waiters time out right as connections come back. The
+  =pools= checker (=SHOW POOLS= after the run) shows a leak as a checked-out
+  count that never drains. A deterministic repro needs a delay injected
+  between the timeout and =Waiting::drop=.
 
 * Known doc discrepancies (no Jepsen needed)
 
@@ -448,7 +474,7 @@ Notes:
   even though the bug was present: Elle needs the weaker txn to hit a
   conflicting interleaving. The isolation checker catches every case.
 
-** TODO M1b: Plain pooler, server-side faults and Jepsen PostgreSQL 12.3 follow-ups (C1, C2, H4)
+** DONE M1b: Plain pooler, server-side faults and Jepsen PostgreSQL 12.3 follow-ups (C1, C2, H4)
 M1 only faulted PgDog and the client side. Ideas taken from Jepsen's
 PostgreSQL 12.3 analysis ([[https://jepsen.io/analyses/postgresql-12.3]]):
 - *Backend faults.* Jepsen killed Postgres processes in random order. A
@@ -494,10 +520,127 @@ PostgreSQL 12.3 analysis ([[https://jepsen.io/analyses/postgresql-12.3]]):
   That tells us how short a run can still be a useful regression test for F1.
 Exit: same as M1: identical to the control, or anomalies triaged.
 
+Done 2026-11-20: identical to the control except F5 (new) and F1 (sweep).
+Matrices: =matrices/m1b.matrix= (26 runs; summaries
+=store/matrix-20261120T015308.tsv= rows 1–3, =store/matrix-20261120T020512.tsv=
+the rest), =matrices/m1b-sweep.matrix= (14; =store/matrix-20261120T031852.tsv=).
+Backend-fault runs use =--concurrency 20 --rate 1000=.
+- [X] Harness:
+  - =nemesis.clj=: =terminate-backend= (=pg_terminate_backend= on one or all
+    of the =jepsen= user's backends, busy ones first), =kill-backend=
+    (SIGKILL one backend, which makes the postmaster restart every session),
+    =restart-postgres= (=pg_ctl stop -m immediate=, 0/2/7 s down, start). Each
+    op records the backend pids it hit. A final =:start-postgres= heals a
+    restart that failed halfway.
+  - The client records the backend pid at the start of every txn and just
+    before =COMMIT= (=:backend-pid=, =:backend-pid-end=).
+  - =backends= checker: no =:ok= txn may span two backends (a silent replay
+    or reroute); every connection-loss error must be explained by a fault on
+    that client's backend or one overlapping it in time; every final read
+    must succeed.
+  - =pools= checker: after the run, =SHOW POOLS= on each PgDog must drain (no
+    server checked out, no client waiting) within 15 s.
+  - =lost= checker: every element appended by an =:ok= txn must appear in the
+    final read of its key. Elle sees a lost acked append only under the
+    real-time models, so this covers RC and =--control= runs too.
+  - =append= options =--tables N=, =--append-path upsert|update-insert|mixed=,
+    =--read-by pk|sk|mixed=, =--key-count=, =--max-writes-per-key=,
+    =--max-txn-length=, =--consistency-models=; =lein run recheck= re-runs
+    Elle on stored histories (=--consistency-models=, =--cycle-search-timeout=).
+- [X] Stronger models: re-checked every M1 history offline under
+      =:strict-serializable= (SER) and =:strong-snapshot-isolation= (RR).
+      Same verdicts as before: only the F1 =--neighbors= runs are invalid.
+      These are now the defaults in pooler mode.
+- [X] One backend fault per run at SER (terminate / kill / restart, each
+      +control): *6/6 valid.*
+- [X] All three backend faults, 6 s interval: RR (+control) valid; SER
+      simple protocol and named prepared statements valid. RC: Elle
+      =:unknown= (cycle search timeout) through PgDog and in the control.
+      Offline with =--cycle-search-timeout 120000= the PgDog run is valid;
+      the control's search runs out of memory (20 GB heap) and stays unknown.
+      Neither has lost appends.
+- [X] H4, =--strict-commit-errors= (every error on =COMMIT= except an
+      08xxx/57P0x connection error counts as a definite abort), all backend
+      faults at 4 s: *PgDog G1a + dirty-update, control valid.* Reproduced
+      with kill-backend + restart-postgres only. → F5.
+- [X] =session-leak= (=reset,set,startup=) under all backend faults (+control):
+      valid. Tracked session state is re-applied on replacement server
+      connections.
+- [X] Write/read paths: =--tables 4 --append-path update-insert --read-by sk
+      --max-writes-per-key 8= at SER/RR/RC (+control): 6/6 valid. Mixed
+      paths and reads with =prepareThreshold=1= and with the simple protocol:
+      valid.
+- [X] Every M1 fault plus every backend fault, 20 s interval, 240 s, mixed
+      paths, SER and RR: valid.
+- [X] Contention sweep for F1 (=--isolation-mode session --neighbors=, SER;
+      baseline 10 keys, 10 clients, pool 4, 60 s; one factor varied per row):
+
+  | Varied            | ok txns | wrong iso | wrong % | wrong/s | first wrong (s) | Elle               |
+  |-------------------+---------+-----------+---------+---------+-----------------+--------------------|
+  | baseline          |    3146 |        83 |     2.6 |    1.16 |            2.00 | G-single-item      |
+  | time 10 s         |     537 |        29 |     5.4 |    1.27 |            2.96 | valid              |
+  | time 30 s         |    1572 |        60 |     3.8 |    1.43 |            2.10 | G-single-item      |
+  | keys 3            |    3126 |       115 |     3.7 |    1.60 |            2.03 | G-single, G2-item  |
+  | keys 30           |    3178 |       102 |     3.2 |    1.42 |            2.01 | G-single, internal |
+  | keys 100          |    3192 |        88 |     2.8 |    1.21 |            2.97 | valid              |
+  | clients 4         |    3254 |        85 |     2.6 |    1.17 |            2.94 | G2-item            |
+  | clients 20        |    3072 |        95 |     3.1 |    1.30 |            3.02 | G2-item            |
+  | clients 40        |    3133 |       106 |     3.4 |    1.47 |            2.11 | G-single-item      |
+  | pool 1            |    2801 |        89 |     3.2 |    1.24 |            2.38 | G2-item            |
+  | pool 2            |    3097 |        94 |     3.0 |    1.29 |            2.98 | G-single, internal |
+  | pool 8            |    3180 |       111 |     3.5 |    1.52 |            3.15 | valid              |
+  | max writes/key 8  |    3344 |        99 |     3.0 |    1.38 |            2.03 | G-single-item      |
+  | 3 keys, 20 clients, pool 1, 30 s | 1516 | 31 |  2.0 |    0.74 |            2.05 | valid              |
+
+  =isolation-checker= caught F1 in every run, within 2–3.2 s; Elle in 10 of
+  14. The rate of misisolated txns barely depends on contention (1.2–1.6/s,
+  2–5% of ok txns): it is set by how often a neighbor's
+  =SET SESSION CHARACTERISTICS= lands on a shared server connection, not by
+  conflicts. *A 10 s run with =isolation-checker= is a reliable regression
+  test for F1; Elle alone is not, even at 60 s.* The two =:internal=
+  anomalies are txns that saw their own key change between two reads
+  (=[:r 724 [3 4 5 6 7]] ... [:append 724 9] [:r 724 [3 4 5 6 7 8 9]]=), both
+  =:isolation-seen "read committed"=: non-repeatable reads inside a
+  "serializable" txn.
+- [X] Results recorded below; F5 drafted; H11 added.
+
+What M1b looked for, and what we saw (outside F5):
+- Silent replay or reroute of a statement or =COMMIT=: none. 0 txns spanned
+  two backends in any run, and reading the code agrees: PgDog never retries a
+  statement on a new server connection.
+- Acked appends lost: 0 in every run (=lost= checker, final reads all =:ok=).
+- An error reaching the wrong client: 0 unexplained connection losses. Every
+  one matched a terminated/killed pid of that client's own backend, or a
+  whole-server fault overlapping the op.
+- A pool that never recovers: every PgDog pool drained after every run.
+- =session-leak= mismatches after a server connection is replaced: none.
+
+Notes:
+- PgDog hides server restarts well: with =restart-postgres= clients saw 114
+  connection errors through PgDog against 38,695 in the control, where clients
+  reconnect straight into "the database system is starting up". Through PgDog
+  they wait in the checkout queue instead.
+- In the control, 124 of 257 =terminate-backend= errors happened before the
+  txn's first statement (an idle connection was killed); through PgDog only 19
+  of 146, because PgDog checks a server connection before handing it out. When
+  that check misses, a client gets PgDog's FATAL 58000 for a txn that never
+  sent a statement (harmless, but see F5 on the code).
+- Jepsen's =jepsen.tests.cycle/final-gen= reads =(partition 8 (range max-key))=,
+  which skips the highest key and the last partial group of 8. =append= now
+  uses its own final generator that reads every key.
+- =terminate-backend= / =kill-backend= ops that land while Postgres is still in
+  crash recovery fail (psql is refused) and are now recorded as skipped.
+- Elle on RC histories with =max-writes-per-key 32= and lots of
+  =restart-postgres= churn exceeds the default 1 s cycle search. Use
+  =recheck --cycle-search-timeout= offline; give lein more heap with
+  =lein update-in : assoc :jvm-opts '["-Xmx20g"]' -- run ...=.
+
 ** TODO M2: Sharded, direct-to-shard (C3)
 - 3 shards, list mapping, every txn touches one shard.
 - Same nemeses as M1 plus shard kill/partition, plus the backend faults from
-  M1b.
+  M1b. Runs with =--strict-commit-errors= will show F5 until it is fixed; to
+  find anything new on top of it, use the default classification (58000 on
+  =COMMIT= as =:info=).
 - Use the M1b =append= variants here as well. A read by secondary key
   (=--read-by sk=) has no shard key, so PgDog broadcasts it to every shard
   and merges the results: a cross-shard read path inside an otherwise
@@ -709,6 +852,58 @@ nor =set_config()= is listed as a limitation.
    =set_config=), mark the server dirty so it is reset on check-in and its
    cache rebuilt.
 
+** F5: A lost server connection during =COMMIT= comes back as SQLSTATE 58000, not a connection error
+Found at =f8738bda0d41= (same PgDog source as F1–F4).
+1. *Claim:* transparency ("neither know there is a proxy in between") and
+   H4. Postgres clients treat a lost connection during =COMMIT= (pgjdbc:
+   SQLSTATE 08006; the server's own =57P01= / =57P02=) as "outcome unknown"
+   and any other error as a definite abort. Through PgDog the lost connection
+   arrives as an ordinary =ErrorResponse=, =FATAL 58000=
+   (=system_error=), so a client that classifies by SQLSTATE treats a
+   committed txn as rolled back.
+2. *Severity:* atomicity as the client sees it: an acked-as-failed txn that
+   committed. A client that retries on that error applies the write twice; one
+   that reports failure lies to its user. No data is lost inside Postgres.
+3. *Reproducer:*
+   =lein run test --nodes n1,n2,n3,n4,n5 -w append --concurrency 20 --rate 1000 --time-limit 180 --strict-commit-errors --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 4=.
+   =--strict-commit-errors= makes the client do what an SQLSTATE-based
+   client does: every error on =COMMIT= except 08xxx / =57P01= / =57P02= /
+   =57P03= / a dropped socket is a definite =:fail=.
+4. *Evidence:* Elle =:anomaly-types (:G1a :dirty-update)=. Of the 4 =COMMIT=
+   errors with SQLSTATE 58000 (=FATAL: net: connection closed by peer= ×3,
+   =FATAL: net: io: Connection reset by peer (os error 104)= ×1), 3 later
+   turned out committed: e.g. txn 34982 =[[:append 2729 6]]= failed at 40.70 s,
+   56 ms after a =restart-postgres=, and txn 35005 read =[1 4 5 6]= for key
+   2729. The 6 =COMMIT= errors that carried the server's own =57P01= are
+   =:info= and harmless.
+   =pgdog-pooler-append-serializable-strict-c20-t180-terminate-backend+kill-backend+restart-postgres/2026-11-20T02:34:25=.
+   Control with the same classification (=...-strict-c20-t180-control-.../2026-11-20T02:37:51=):
+   valid, because pgjdbc reports the dropped socket as 08006 itself.
+   Reproduced with =--nemesis kill-backend,restart-postgres= only: G1a +
+   dirty-update again, 7 of the 9 =COMMIT= errors with 58000 committed;
+   control valid
+   (=...-strict-c20-t180-kill-backend+restart-postgres/2026-11-20T03:46:54=,
+   =...-control-kill-backend+restart-postgres/2026-11-20T03:50:29=;
+   =store/matrix-20261120T034648.tsv=).
+5. *Root cause:* =pgdog/src/net/messages/error_response.rs:316=
+   (=ErrorResponse::from_client_err=). When the client's server connection hits
+   EOF or a reset (=Backend(backend::Error::Net(..))=, message
+   =net: connection closed by peer=; it can't be the client's own socket,
+   since the client received the message), the client loop
+   (=frontend/client/mod.rs:537=) sends =FATAL= with code 58000 for every error
+   except =ExecutionError= and admin termination. When the server dies
+   without sending its own =57P01= (SIGKILL, =pg_ctl stop -m immediate= before
+   the backend writes, network loss), the client only ever sees 58000.
+6. *Suggested fix:* when the server connection is lost while a client request
+   is in flight, send SQLSTATE =08006= (=connection_failure=), or close the
+   client socket without an =ErrorResponse= and let the driver raise its own
+   connection error. Keep 58000 for PgDog's own definite errors.
+   *Regression test:* unit test that =from_client_err= maps
+   =Backend(Net(UnexpectedEof | ConnectionReset ...))= to an 08xxx code; plus
+   an integration test that sends =SIGKILL= to a server connection's backend
+   while a client waits on =SELECT pg_sleep(10)= (so Postgres sends no
+   =57P01=), and checks the client's SQLSTATE is 08xxx.
+
 * Results
 | Claim | Config | Nemesis | Outcome | Run (store path) | Finding # |
 |-------+--------+---------+---------+------------------+-----------|
@@ -726,6 +921,17 @@ nor =set_config()= is listed as a limitation.
 | C2 | session-leak: set_config literal, parser on | none | holds | =...-reset+set-config-parser-on/2026-11-19T21:42:01= | |
 | C2 | session-leak: set_config bind params (parser auto and on) | none | *bug* | =matrix-20261119T213550.tsv= rows 3, 7 | F3, F4 |
 | C2 | session-leak: all mechanisms (+control) | none | *bug* (control valid) | =pgdog-pooler-session-leak/2026-11-19T22:59:52= | F1–F4 |
+| C1 | all M1 histories re-checked offline as strict-serializable / strong-SI | (as M1) | same verdicts; only F1 runs invalid | M1 store dirs, =recheck-*/= | F1 |
+| C1 | append SER (+control) | terminate-backend / kill-backend / restart-postgres, one per run | holds (6/6 valid; no lost appends, no split txns) | =matrix-20261120T015308.tsv= rows 1–3, =matrix-20261120T020512.tsv= rows 1–3 | |
+| C1 | append RR (+control); SER simple; SER prep1 | all backend faults, 6 s | holds (4/4 valid) | =matrix-20261120T020512.tsv= rows 4, 5, 8, 9 | |
+| C1 | append RC (+control) | all backend faults, 6 s | PgDog valid offline (=--cycle-search-timeout 120000=); control unknown (OOM); 0 lost appends in both | =matrix-20261120T020512.tsv= rows 6, 7 | |
+| C1 | append SER, =--strict-commit-errors= (+control) | all backend faults, 4 s | *bug*: G1a + dirty-update through PgDog; control valid | =pgdog-pooler-append-serializable-strict-c20-t180-terminate-backend+kill-backend+restart-postgres/2026-11-20T02:34:25= | F5 |
+| C1 | same, reproduction (+control) | kill-backend, restart-postgres, 4 s | *bug* again: G1a + dirty-update; control valid | =matrix-20261120T034648.tsv= | F5 |
+| C2 | session-leak: SET, RESET, startup options (+control) | all backend faults, 6 s | holds | =matrix-20261120T020512.tsv= rows 12, 13 | |
+| C1 | append SER/RR/RC, 4 tables, update-insert, read by sk, mwpk 8 (+control); mixed paths with prep1 and simple | none | holds (8/8 valid) | =matrix-20261120T020512.tsv= rows 14–21 | |
+| C1 | append SER, RR, 4 tables, mixed paths, mwpk 8 | every M1 + backend fault, 20 s, 240 s | holds (2/2 valid) | =matrix-20261120T020512.tsv= rows 22, 23 | |
+| C1 | F1 contention sweep: keys, clients, pool size, run length | none | *bug* in 14/14 (isolation-checker); Elle 10/14 | =matrix-20261120T031852.tsv= | F1 |
+| — | pool recovery (=SHOW POOLS= drains after the run) | every M1b run | holds | =:pools= in each =results.edn= | (H11 open) |
 
 * Open questions
 - Which edition/version is in scope? Some features (e.g. automatic

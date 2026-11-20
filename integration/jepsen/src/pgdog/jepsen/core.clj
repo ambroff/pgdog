@@ -7,11 +7,15 @@
                     [generator :as gen]
                     [role :as role]
                     [tests :as tests]]
+            [elle.consistency-model :as cm]
             [jepsen.checker.timeline :as timeline]
+            [jepsen.nemesis :as n]
             [jepsen.nemesis.combined :as nc]
             [jepsen.os.debian :as debian]
+            [pgdog.jepsen.client :as pc]
             [pgdog.jepsen.db :as db]
             [pgdog.jepsen.nemesis :as pn]
+            [pgdog.jepsen.recheck :as recheck]
             [pgdog.jepsen.workload.append :as append]
             [pgdog.jepsen.workload.session-leak :as session-leak]))
 
@@ -25,7 +29,9 @@
   Jepsen clients off from whatever they connect to; admin runs RELOAD /
   RECONNECT and pause-pool runs PAUSE / RESUME on PgDog's admin database."
   #{:kill-pgdog :pause-pgdog :kill-postgres :pause-postgres :partition
-    :partition-clients :admin :pause-pool})
+    :partition-clients :admin :pause-pool
+    ;; Backend faults on the Postgres side (see pn/backend-package):
+    :terminate-backend :kill-backend :restart-postgres})
 
 (defn roles
   "Splits the node list: the first --pgdog-count nodes run PgDog, the rest run
@@ -65,7 +71,9 @@
                        (when (faults :admin)
                          (pn/admin-package base))
                        (when (faults :pause-pool)
-                         (pn/pool-pause-package base))]
+                         (pn/pool-pause-package base))
+                       (when (some faults (keys pn/backend-faults))
+                         (pn/backend-package (assoc base :faults faults)))]
                       (remove nil?))]
     (if (seq pkgs)
       (nc/compose-packages pkgs)
@@ -85,6 +93,36 @@
 
               (and (= :append (:workload opts)) (= :session (:isolation-mode opts)))
               (conj "session-iso")
+
+              (not= 1 (:tables opts))
+              (conj (str "tables" (:tables opts)))
+
+              (not= :upsert (:append-path opts))
+              (conj (name (:append-path opts)))
+
+              (not= :pk (:read-by opts))
+              (conj (str "read-" (name (:read-by opts))))
+
+              (not= 10 (:key-count opts))
+              (conj (str "keys" (:key-count opts)))
+
+              (not= 32 (:max-writes-per-key opts))
+              (conj (str "mwpk" (:max-writes-per-key opts)))
+
+              (not= 4 (:pool-size opts))
+              (conj (str "pool" (:pool-size opts)))
+
+              (:strict-commit-errors opts)
+              (conj "strict")
+
+              true
+              (conj (str "c" (:concurrency opts)))
+
+              (not= 60 (:time-limit opts))
+              (conj (str "t" (:time-limit opts)))
+
+              (seq (:consistency-models opts))
+              (conj (str/join "+" (map name (:consistency-models opts))))
 
               (:neighbors opts)
               (conj "neighbors")
@@ -122,11 +160,12 @@
             :os        debian/os
             :db        db
             :client    (role/restrict-client :pgdog (:client workload))
-            :nemesis   (:nemesis pkg)
+            :nemesis   (n/compose [(:nemesis pkg) (pn/pool-stats-nemesis)])
             :checker   (checker/compose
                          {:perf       (checker/perf {:nemeses (:perf pkg)})
                           :stats      (checker/stats)
                           :exceptions (checker/unhandled-exceptions)
+                          :pools      (pc/pool-checker)
                           :timeline   (timeline/html)
                           :workload   (:checker workload)})
             :generator (wrap
@@ -139,7 +178,9 @@
                            (gen/nemesis (:final-generator pkg))
                            (gen/log "Waiting for recovery")
                            (gen/sleep (:recovery-time opts))
-                           (gen/clients (:final-generator workload))))})))
+                           (gen/clients (:final-generator workload))
+                           (gen/log "Checking that pools drained")
+                           (gen/nemesis {:type :info, :f :pool-stats, :value nil})))})))
 
 (defn parse-faults [s]
   (->> (str/split s #",")
@@ -168,6 +209,40 @@
     :default :serializable
     :parse-fn keyword
     :validate [#{:serializable :repeatable-read :read-committed} "unknown isolation level"]]
+
+   [nil "--tables N" "append: spread keys over N tables (by hash of the key)"
+    :default 1
+    :parse-fn parse-long
+    :validate [pos? "must be positive"]]
+
+   [nil "--append-path PATH" "append: upsert (INSERT ON CONFLICT), update-insert (UPDATE, then INSERT in a SAVEPOINT), or mixed"
+    :default :upsert
+    :parse-fn keyword
+    :validate [#{:upsert :update-insert :mixed} "must be upsert, update-insert or mixed"]]
+
+   [nil "--read-by KEY" "append: read by pk, by the unindexed secondary key sk (table scan), or mixed"
+    :default :pk
+    :parse-fn keyword
+    :validate [#{:pk :sk :mixed} "must be pk, sk or mixed"]]
+
+   [nil "--key-count N" "append: keys active at once"
+    :default 10
+    :parse-fn parse-long]
+
+   [nil "--max-writes-per-key N" "append: appends per key before it is retired for a fresh one (lower = more fresh inserts)"
+    :default 32
+    :parse-fn parse-long]
+
+   [nil "--max-txn-length N" "append: micro-ops per transaction"
+    :default 4
+    :parse-fn parse-long]
+
+   [nil "--consistency-models LIST" (str "append: Elle models to check, comma-separated. Default: strict-serializable / "
+                                         "strong-snapshot-isolation / read-committed in pooler mode, plain serializable / "
+                                         "snapshot-isolation / read-committed otherwise")
+    :parse-fn parse-faults
+    :validate [#(try (cm/anomalies-prohibited-by %) true (catch Exception _ false))
+               "unknown Elle consistency model"]]
 
    [nil "--isolation-mode MODE" "txn: SET TRANSACTION per txn; session: JDBC setTransactionIsolation"
     :default :txn
@@ -256,5 +331,13 @@
   [& args]
   (cli/run! (merge (cli/single-test-cmd {:test-fn  test-fn
                                          :opt-spec opt-spec})
-                   (cli/serve-cmd))
+                   (cli/serve-cmd)
+                   {"recheck" {:opt-spec [[nil "--consistency-models LIST"
+                                           "Elle models, comma-separated (default: strong model for the test's isolation level)"
+                                           :parse-fn parse-faults]
+                                          [nil "--cycle-search-timeout MS"
+                                           "Elle's per-anomaly cycle search budget (Elle default 1000)"
+                                           :parse-fn parse-long]]
+                               :usage    "Usage: lein run recheck [--consistency-models LIST] [--cycle-search-timeout MS] STORE_DIR..."
+                               :run      recheck/run-cmd!}})
             args))
