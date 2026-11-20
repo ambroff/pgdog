@@ -1,0 +1,50 @@
+# M1: PgDog as a plain pooler (C1, C2). One Postgres (n3), two PgDogs (n1,
+# n2), transaction pooling, pool_size 4 per PgDog vs 10 clients, so server
+# connections are shared. Configs run against PgDog and, where the fault can
+# reach the client path, with --control (straight to Postgres). With --control
+# only partition-clients affects clients; the PgDog-only faults (kill, pause,
+# admin, pool pause, PgDog<->Postgres partition) don't touch the client path.
+#
+# One fault per run at serializable (the strictest checker): with every fault
+# enabled at the default 10 s interval PgDog is down most of the time and Elle
+# sees too few transactions. Combined-fault runs use a 30 s interval.
+
+# --- C1: append at each isolation level, no faults ---
+-w append --isolation serializable    --time-limit 120
+-w append --isolation serializable    --time-limit 120 --control
+-w append --isolation repeatable-read --time-limit 120
+-w append --isolation repeatable-read --time-limit 120 --control
+-w append --isolation read-committed  --time-limit 120
+-w append --isolation read-committed  --time-limit 120 --control
+
+# --- C1: serializable, one fault at a time ---
+-w append --isolation serializable --time-limit 120 --nemesis kill-pgdog
+-w append --isolation serializable --time-limit 120 --nemesis pause-pgdog
+-w append --isolation serializable --time-limit 120 --nemesis partition-clients
+-w append --isolation serializable --time-limit 120 --nemesis partition-clients --control
+-w append --isolation serializable --time-limit 120 --nemesis partition
+-w append --isolation serializable --time-limit 120 --nemesis admin
+-w append --isolation serializable --time-limit 120 --nemesis pause-pool
+
+# --- C1: weaker levels and protocol variants, all faults, 30 s interval ---
+-w append --isolation repeatable-read --time-limit 180 --nemesis-interval 30 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition
+-w append --isolation repeatable-read --time-limit 180 --nemesis-interval 30 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition --control
+-w append --isolation read-committed  --time-limit 180 --nemesis-interval 30 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition
+-w append --isolation read-committed  --time-limit 180 --nemesis-interval 30 --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition --control
+-w append --isolation serializable --time-limit 180 --nemesis-interval 30 --query-mode simple     --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition
+-w append --isolation serializable --time-limit 180 --nemesis-interval 30 --prepare-threshold 1  --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition
+
+# --- C1 x C2: isolation set once per session through JDBC
+# (setTransactionIsolation -> SET SESSION CHARACTERISTICS), the way HikariCP's
+# transactionIsolation and Spring's @Transactional(isolation=...) do it ---
+-w append --isolation serializable    --isolation-mode session --time-limit 120
+-w append --isolation serializable    --isolation-mode session --time-limit 120 --control
+-w append --isolation repeatable-read --isolation-mode session --time-limit 120
+-w append --isolation repeatable-read --isolation-mode session --time-limit 120 --control
+
+# --- C2: session state, every mechanism, no faults ---
+-w session-leak --concurrency 20 --time-limit 60
+-w session-leak --concurrency 20 --time-limit 60 --control
+# Only the mechanisms PgDog tracks (SET, RESET, startup options), all faults:
+-w session-leak --concurrency 20 --time-limit 180 --nemesis-interval 30 --session-mechanisms reset,set,startup --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition
+-w session-leak --concurrency 20 --time-limit 180 --nemesis-interval 30 --session-mechanisms reset,set,startup --nemesis kill-pgdog,pause-pgdog,partition-clients,admin,pause-pool,partition --control

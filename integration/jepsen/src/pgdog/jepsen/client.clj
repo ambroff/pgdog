@@ -5,6 +5,7 @@
   happen) or :info (may or may not have happened)."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
+            [jepsen.checker :as checker]
             [jepsen.role :as role]
             [next.jdbc :as j]
             [pgdog.jepsen.db :as db])
@@ -20,24 +21,45 @@
     [node db/pgdog-port]))
 
 (defn open
-  "Opens a JDBC connection to `node` (a PgDog node, unless --control)."
-  ^Connection [test node]
-  (let [[host port] (target test node)]
-    (j/get-connection
-      {:dbtype           "postgresql"
-       :host             host
-       :port             port
-       :dbname           db/database
-       :user             db/user
-       :password         db/password
-       ;; 0 = unnamed statements only; >0 = named server-side prepared
-       ;; statements after N uses (exercises PgDog's statement rewriting).
-       :prepareThreshold (:prepare-threshold test)
-       :preferQueryMode  (name (:query-mode test))
-       :connectTimeout   5
-       :socketTimeout    10
-       :tcpKeepAlive     true
-       :ApplicationName  "jepsen"})))
+  "Opens a JDBC connection to `node` (a PgDog node, unless --control). `extra`
+  is merged into the connection properties, e.g. {:options \"-c x=y\"} to
+  send startup parameters."
+  (^Connection [test node] (open test node {}))
+  (^Connection [test node extra]
+   (let [[host port] (target test node)]
+     (j/get-connection
+       (merge
+         {:dbtype           "postgresql"
+          :host             host
+          :port             port
+          :dbname           db/database
+          :user             db/user
+          :password         db/password
+          ;; 0 = unnamed statements only; >0 = named server-side prepared
+          ;; statements after N uses (exercises PgDog's statement rewriting).
+          :prepareThreshold (:prepare-threshold test)
+          :preferQueryMode  (name (:query-mode test))
+          :connectTimeout   5
+          :socketTimeout    10
+          :tcpKeepAlive     true
+          :ApplicationName  "jepsen"}
+         extra)))))
+
+(defn admin!
+  "Runs one command (e.g. RELOAD) on a PgDog node's admin database. The admin
+  database only speaks the simple query protocol."
+  [node sql]
+  (with-open [conn (j/get-connection
+                     {:dbtype          "postgresql"
+                      :host            node
+                      :port            db/pgdog-port
+                      :dbname          db/admin-database
+                      :user            db/admin-user
+                      :password        db/password
+                      :preferQueryMode "simple"
+                      :connectTimeout  5
+                      :socketTimeout   10})]
+    (j/execute! conn [sql])))
 
 (defn close! [^Connection conn]
   (when conn
@@ -115,10 +137,15 @@
         (when (= :txn (:isolation-mode test))
           (j/execute! conn [(str "SET TRANSACTION ISOLATION LEVEL "
                                  (isolation-sql iso))]))
-        (let [value (f conn)]
+        ;; Record the level the server actually runs this txn at, so a
+        ;; txn that silently ran at a weaker level shows up even when Elle
+        ;; finds no anomaly (see isolation-checker).
+        (let [seen  (:iso (j/execute-one!
+                            conn ["SELECT current_setting('transaction_isolation') AS iso"]))
+              value (f conn)]
           (vreset! phase :commit)
           (.commit conn)
-          (assoc op :type :ok, :value value)))
+          (assoc op :type :ok, :value value, :isolation-seen seen)))
       (catch Throwable e
         (let [conn @conn-atom]
           (if (or (nil? conn) (connection-error? e))
@@ -135,3 +162,19 @@
 
           :else
           (assoc op :type :info, :error [@phase (error-type e) (.getMessage e)]))))))
+
+(defn isolation-checker
+  "Checks that every ok transaction ran at the isolation level the test asked
+  for, as reported by the server inside the transaction (:isolation-seen)."
+  []
+  (reify checker/Checker
+    (check [_ test history opts]
+      (let [want  (str/lower-case (isolation-sql (:isolation test)))
+            oks   (filter #(and (= :ok (:type %)) (contains? % :isolation-seen)) history)
+            wrong (remove #(= want (:isolation-seen %)) oks)]
+        {:valid?      (empty? wrong)
+         :expected    want
+         :ok-count    (count oks)
+         :seen        (frequencies (map :isolation-seen oks))
+         :wrong-count (count wrong)
+         :examples    (vec (take 10 wrong))}))))

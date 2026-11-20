@@ -166,6 +166,9 @@ confirms or rules it out.
   or fails to follow, a client across server connections, the client silently
   gets a weaker isolation level.
 - Test: session-isolation-leak workload.
+- *Confirmed in M1* for =SET SESSION CHARACTERISTICS= (and so for JDBC's
+  =setTransactionIsolation=) and for =set_config()=. Plain =SET= /
+  =RESET= / startup options are tracked correctly. See F1–F3.
 
 ** H10: Resharding cutover window
 - The drain reads =pg_current_wal_lsn()= after traffic stop and
@@ -268,6 +271,8 @@ Follow the existing integration convention (each suite in
 #+begin_example
 integration/jepsen/
   run.sh                 # builds pgdog, brings up nodes, runs a smoke matrix
+  matrix.sh              # runs every line of a matrices/*.matrix file, one summary line each
+  matrices/              # m1.matrix, m1-neighbors.matrix, session-leak-triage.matrix, ...
   nodes.sh               # Incus VM lifecycle: up / reset / down
   cloud-init.yaml        # node user-data (root SSH, packages)
   project.clj            # Leiningen; jepsen, elle, next.jdbc, pgjdbc
@@ -388,7 +393,7 @@ Bring-up notes:
   VM) with no server operation pending. =nodes.sh= now wraps both in
   =timeout= and snapshots stopped VMs.
 
-** TODO M1: PgDog as a plain pooler (C1, C2)
+** DONE M1: PgDog as a plain pooler (C1, C2)
 - Single Postgres, transaction pooling, pool much smaller than client count
   so server connections are shared.
 - =append= at all three isolation levels; =session-leak=.
@@ -397,6 +402,49 @@ Bring-up notes:
 - Every config also runs with =--control= (direct to Postgres). Anomalies seen
   only through PgDog are PgDog's.
 Exit: results identical to the control, or anomalies triaged.
+
+Done 2026-11-19. Matrices: =matrices/m1.matrix= (27 runs),
+=matrices/m1-neighbors.matrix= (5), =matrices/session-leak-triage.matrix= (8).
+- [X] Harness: =pooler_mode= / =query_parser= options (=db.clj=); new
+      nemeses (=nemesis.clj=): =partition-clients= (iptables on the PgDog
+      nodes, or on Postgres with =--control=, dropping the control node's
+      traffic on the client port), =admin= (=RELOAD= / =RECONNECT= on one or
+      all PgDogs), =pause-pool= (=PAUSE= … =RESUME=)
+- [X] =session-leak= workload + checker; =append= records the isolation level
+      the server reports inside every txn (=:isolation-seen=), checked by
+      =isolation-checker= alongside Elle
+- [X] =append= with isolation set per txn (=SET TRANSACTION=), at all three
+      levels, no faults and under every fault (one fault per run at
+      serializable; all faults at a 30 s interval for RR/RC and for the simple
+      and named-prepared protocol variants): *valid everywhere, same as the
+      control.* C1 holds for this usage.
+- [X] =session-leak=: PgDog fails, control passes. Tracked mechanisms (=SET=,
+      =RESET=, startup =options=) pass on their own, also under every fault.
+      Untracked ones fail: F1, F2, F3.
+- [X] =append= with isolation set per session through JDBC, sharing the pool
+      with clients that set READ COMMITTED the same way (=--neighbors=):
+      *Elle G2-item / G-single-item at serializable, lost-update /
+      G-single-item at repeatable read; 4.4% / 3.9% of ok txns ran at read
+      committed.* Control valid. Same mix with per-txn =SET TRANSACTION=:
+      valid. This is F1 as a C1 violation.
+- [X] Results recorded below; findings drafted in [[*Findings][Findings]].
+
+Notes:
+- With every fault enabled at the default 10 s interval PgDog is down or cut
+  off most of the time (361 ok txns in 120 s). Use one fault per run, or a
+  30 s interval when combining.
+- Admin ops fail while =partition-clients= is active (same port); expected.
+- =RELOAD= and =RECONNECT= cause no client-visible errors: 13 admin ops in a
+  120 s serializable run, 0 failed/indeterminate txns caused by them.
+- The kill package can leave one PgDog down for over a minute (n2: 8 s → 87 s
+  in the =prep1= run), so clients pinned to it fast-fail with "connection
+  refused"; that is why that run has 6123 =:fail=. Not a PgDog issue.
+- Uniform pools hide F1: when every client sets the same level via
+  =setTransactionIsolation=, the leaked setting is the one everyone wants
+  (=session-iso= runs are valid). The bug needs a mixed pool.
+- The first neighbors run, before =:isolation-seen= existed, was Elle-valid
+  even though the bug was present: Elle needs the weaker txn to hit a
+  conflicting interleaving. The isolation checker catches every case.
 
 ** TODO M2: Sharded, direct-to-shard (C3)
 - 3 shards, list mapping, every txn touches one shard.
@@ -472,9 +520,153 @@ seen it.
 - Also include what was tested and found to hold, along with the fault
   coverage. A clean result is useful to the PgDog devs too.
 
+* Findings
+Draft report entries (private; see [[*Reporting and triage][Reporting and triage]]).
+All found at PgDog commit =7e68d3b15c8a= (branch =jepsen=), Postgres 17,
+=pooler_mode = "transaction"=, one Postgres, two PgDogs, =default_pool_size = 4=.
+Store paths are under =integration/jepsen/store/=.
+
+The docs claim (https://docs.pgdog.dev/features/connection-pooler/transaction-mode/,
+"Session state"): "To avoid session-level state leaking between clients,
+PgDog tracks connection parameters for each client and updates connection
+settings before giving a connection to each client", and "PgDog
+automatically detects =SET= commands". Neither =SET SESSION CHARACTERISTICS=
+nor =set_config()= is listed as a limitation.
+
+** F1: =SET SESSION CHARACTERISTICS= (JDBC =setTransactionIsolation=) is not tracked; txns silently run at a weaker isolation level
+1. *Claims:* C2 (session state follows the client) and, as a consequence, C1
+   (same isolation as Postgres).
+2. *Severity:* isolation violation (wrong isolation level, Elle anomalies),
+   plus session state leaking between clients.
+3. *Reproducer:*
+   =lein run test --nodes n1,n2,n3,n4,n5 -w append --isolation serializable --isolation-mode session --neighbors --concurrency 10 --time-limit 120=.
+   Half the clients ask for SERIALIZABLE per session via
+   =Connection.setTransactionIsolation=, which pgjdbc sends as
+   =SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...=. This is
+   what Spring's =@Transactional(isolation = ...)= and HikariCP's
+   =transactionIsolation= do. The other half share the pool and set READ
+   COMMITTED the same way. No faults needed.
+   Smaller repro: =-w session-leak --session-mechanisms reset,characteristics=
+   (or =reset,jdbc=).
+4. *Evidence:*
+   - Serializable: Elle =:anomaly-types (:G-single-item :G2-item)=; 271 of
+     6198 ok txns report =transaction_isolation = 'read committed'= from
+     inside the txn. An Elle cycle contains txn 3453 (=[[:r 271 nil] [:r 269 [2]] [:append 269 4]]=,
+     =:isolation-seen "read committed"=).
+     =pgdog-pooler-append-serializable-session-iso-neighbors/2026-11-19T23:29:24=.
+     Control (=...-neighbors-control/2026-11-19T23:32:01=): Elle valid, 6238/6238
+     serializable.
+   - Repeatable read: Elle =(:G-single-item :lost-update)=; 241 of 6158 ok
+     txns at read committed. =...-repeatable-read-session-iso-neighbors/2026-11-19T23:34:34=;
+     control valid.
+   - Same client mix with =SET TRANSACTION= per txn: valid, 6110/6110
+     serializable (=pgdog-pooler-append-serializable-neighbors/2026-11-19T23:39:41=).
+   - =session-leak=, =reset,characteristics=: 1468 mismatches in 30 s, e.g. a
+     client that asked for repeatable read saw read committed, and a client
+     that ran =RESET= saw =serializable= (another client's setting).
+     Same with =query_parser = "on"= (1373) and =reset,jdbc= (1340).
+5. *Root cause:* =pgdog/src/frontend/router/parser/query/set.rs:19=.
+   =VAR_SET_MULTI= (=SET TRANSACTION ...= and =SET SESSION CHARACTERISTICS ...=)
+   becomes a plain =Command::Query=. It runs on whatever server connection
+   the client holds, is not recorded in the client's parameters, and doesn't
+   mark the server dirty, so it stays on that server connection for the next
+   client and doesn't follow this client to its next server connection.
+6. *Suggested fix:* treat =SET SESSION CHARACTERISTICS AS TRANSACTION
+   ISOLATION LEVEL x= / =READ ONLY|WRITE= / =[NOT] DEFERRABLE= as
+   =SET default_transaction_isolation= / =default_transaction_read_only= /
+   =default_transaction_deferrable= (that is what Postgres does internally),
+   i.e. a tracked =Command::Set=. Keep =SET TRANSACTION= as a passthrough.
+   *Regression test:* in =test_set.rs=, expect
+   =SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE=
+   to produce =Command::Set= with =default_transaction_isolation=; plus a
+   Python integration test: two clients on a 1-connection pool, one runs
+   =SET SESSION CHARACTERISTICS ... SERIALIZABLE=, the other checks
+   =current_setting('transaction_isolation')=.
+
+** F2: =SELECT set_config(name, value, false)= is not tracked under the default =query_parser = "auto"=
+1. *Claim:* C2.
+2. *Severity:* session state leak between clients (any GUC, e.g. an RLS
+   tenant id set with =set_config('app.tenant_id', ..., false)=), and lost
+   settings. If the GUC is an isolation level, a C1 violation as in F1.
+3. *Reproducer:* =-w session-leak --session-mechanisms reset,set-config=.
+4. *Evidence:* 3736 mismatches in 30 s; =RESET= clients saw another client's
+   unique =lock_timeout= 1202 times
+   (=pgdog-pooler-session-leak-reset+set-config/2026-11-19T21:37:12=). With
+   =--query-parser on= the same run is valid
+   (=...-reset+set-config-parser-on/2026-11-19T21:42:01=), so PgDog's
+   =set_config= handling works when reached.
+5. *Root cause:* =pgdog/src/frontend/regex_parser.rs:99=. In =auto= mode
+   without sharding or read/write splitting, PgDog only runs the parser for
+   queries the regex prefilter flags. =is_common_query()= returns early for
+   anything starting with =SELECT=, so =SELECT set_config(...)= never reaches
+   =set_config.rs=.
+6. *Suggested fix:* in =RegexParser::use_parser=, check for =set_config=
+   before the =SELECT= shortcut (or add a =\bset_config\s*\(= pattern to
+   =CMD_BASE= and skip =is_common_query= when it matches).
+   *Regression test:* =regex_parser.rs= unit test that
+   =SELECT set_config('x', 'y', false)= matches at =QueryParserLevel::Auto=.
+
+** F3: =set_config()= with bind parameters is never tracked, even with =query_parser = "on"=
+1. *Claim:* C2.
+2. *Severity:* as F2. This is the usual way an application sets a
+   per-session value from user input (=SELECT set_config('app.tenant_id', $1, false)=),
+   so it is the RLS case.
+3. *Reproducer:* =-w session-leak --session-mechanisms reset,set-config-bind --query-parser on=
+   (extended protocol, the default).
+4. *Evidence:* 3591 mismatches in 30 s, 1023 of them =RESET= clients seeing
+   another client's value
+   (=pgdog-pooler-session-leak-reset+set-config-bind-parser-on/2026-11-19T21:43:14=).
+5. *Root cause:* =pgdog/src/frontend/router/parser/query/set_config.rs:38,48=.
+   =parse_args= only accepts =A_Const= arguments; a =ParamRef= (=$1=) falls
+   through to a plain =Command::Query= with no tracking and no dirty mark.
+6. *Suggested fix:* resolve =ParamRef= arguments from the =Bind= message (the
+   values are there by the time the query runs). Failing that, when a
+   session-scoped =set_config= can't be parsed, mark the server dirty and
+   pin the client to it until it disconnects (like advisory locks), or reject
+   it. Document the limitation either way.
+   *Regression test:* unit test for =set_config($1, $2, false)= with a bound
+   =Bind=.
+
+** F4: An untracked session change also breaks clients that use only tracked =SET= / =RESET=
+1. *Claim:* C2. Makes F1–F3 affect well-behaved clients too.
+2. *Severity:* session state leak between clients.
+3. *Reproducer:* any F1–F3 run; look at the =:reset= / =:set= / =:startup=
+   rows of =:by-param+mechanism=.
+4. *Evidence:* tracked mechanisms alone pass, also under every fault
+   (=...-reset+set+startup/2026-11-19T21:36:00=;
+   =...-reset+set+startup-kill-pgdog+...+partition/2026-11-19T23:02:57=). Mixed
+   with an untracked mechanism, clients that only ever used =RESET= saw other
+   clients' values (1202 times in the =set-config= run) and 676–844 wrong
+   isolation levels per 30 s run; in the all-mechanisms run, =SET= and startup
+   =options= clients also got wrong isolation levels (8 and 9 times,
+   =pgdog-pooler-session-leak/2026-11-19T22:59:52=).
+5. *Root cause:* PgDog syncs a server connection by comparing the client's
+   parameters to its /cached/ view of the server's parameters
+   (=Server::link_client=, =backend/server.rs:768=: =client_params.sync(params)=).
+   An untracked change makes that cache wrong, so PgDog skips the =SET= /
+   =RESET= the next client needs.
+6. *Suggested fix:* besides F1–F3: whenever a statement that may change
+   session state runs untracked (unparsed =SET=-like passthrough, unparsed
+   =set_config=), mark the server dirty so it is reset on check-in and its
+   cache rebuilt.
+
 * Results
 | Claim | Config | Nemesis | Outcome | Run (store path) | Finding # |
 |-------+--------+---------+---------+------------------+-----------|
+| C1 | append SER/RR/RC, per-txn isolation, PgDog + control | none | holds (6/6 valid) | =matrix-20261119T215542.tsv= rows 1–6 | |
+| C1 | append SER, per-txn isolation | kill-pgdog / pause-pgdog / partition-clients (+control) / partition / admin / pause-pool, one per run | holds (7/7 valid) | =matrix-20261119T215542.tsv= rows 7–13 | |
+| C1 | append RR, RC (+control); SER simple protocol; SER named prepared (=prepareThreshold=1=) | all M1 faults, 30 s interval | holds (6/6 valid) | =matrix-20261119T215542.tsv= rows 14–19 | |
+| C1 | append SER, RR, session isolation via JDBC, uniform pool (+control) | none | holds (4/4 valid) | =matrix-20261119T215542.tsv= rows 20–23 | |
+| C1 | append SER, session isolation via JDBC, mixed pool (=--neighbors=) | none | *bug*: G2-item, G-single-item; 271 txns at RC | =pgdog-pooler-append-serializable-session-iso-neighbors/2026-11-19T23:29:24= | F1 |
+| C1 | append RR, session isolation via JDBC, mixed pool | none | *bug*: lost-update, G-single-item; 241 txns at RC | =pgdog-pooler-append-repeatable-read-session-iso-neighbors/2026-11-19T23:34:34= | F1 |
+| C1 | same two, =--control= | none | valid | =matrix-20261119T232918.tsv= rows 2, 4 | |
+| C1 | append SER, per-txn isolation, mixed pool | none | holds | =pgdog-pooler-append-serializable-neighbors/2026-11-19T23:39:41= | |
+| C2 | session-leak: SET, RESET, startup options | none; all M1 faults (+control) | holds | =...-reset+set+startup/2026-11-19T21:36:00=, =...-reset+set+startup-kill-pgdog+...+partition/2026-11-19T23:02:57= and its control | |
+| C2 | session-leak: SET SESSION CHARACTERISTICS, JDBC (parser auto and on) | none | *bug* | =matrix-20261119T213550.tsv= rows 4, 5, 8 | F1, F4 |
+| C2 | session-leak: set_config literal, parser auto | none | *bug* | =...-reset+set-config/2026-11-19T21:37:12= | F2, F4 |
+| C2 | session-leak: set_config literal, parser on | none | holds | =...-reset+set-config-parser-on/2026-11-19T21:42:01= | |
+| C2 | session-leak: set_config bind params (parser auto and on) | none | *bug* | =matrix-20261119T213550.tsv= rows 3, 7 | F3, F4 |
+| C2 | session-leak: all mechanisms (+control) | none | *bug* (control valid) | =pgdog-pooler-session-leak/2026-11-19T22:59:52= | F1–F4 |
 
 * Open questions
 - Which edition/version is in scope? Some features (e.g. automatic

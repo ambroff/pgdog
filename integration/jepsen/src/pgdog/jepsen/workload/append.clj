@@ -3,10 +3,12 @@
   comma-separated list of integers. Transactions are sequences of
   [:r k nil] and [:append k v] micro-ops."
   (:require [clojure.string :as str]
-            [jepsen.client :as client]
+            [jepsen [checker :as checker]
+                    [client :as client]]
             [jepsen.tests.cycle.append :as append]
             [next.jdbc :as j]
-            [pgdog.jepsen.client :as pc]))
+            [pgdog.jepsen.client :as pc])
+  (:import (java.sql Connection)))
 
 (defn parse-list [s]
   (when s
@@ -26,16 +28,40 @@
                      k (str v)])
         mop)))
 
-(defrecord Client [node conn]
+(def neighbor-counter
+  "Alternates clients between append clients and neighbors (--neighbors)."
+  (atom 0))
+
+(defn neighbor!
+  "What a neighbor does instead of an append txn: another application on the
+  same pool (same user and database) that sets its session to READ COMMITTED
+  the way pgjdbc does, then runs a trivial query. It never touches the append
+  table, so the op completes as :fail and Elle ignores it."
+  [test node conn-atom op]
+  (try
+    (let [^Connection conn (or @conn-atom (reset! conn-atom (pc/open test node)))]
+      (.setAutoCommit conn true)
+      (.setTransactionIsolation conn Connection/TRANSACTION_READ_COMMITTED)
+      (j/execute! conn ["SELECT 1"])
+      (assoc op :type :fail, :error [:neighbor]))
+    (catch Throwable e
+      (pc/close! @conn-atom)
+      (reset! conn-atom nil)
+      (assoc op :type :fail, :error [:neighbor (pc/error-type e)]))))
+
+(defrecord Client [node conn neighbor?]
   client/Client
   (open! [_ test node]
-    (Client. node (atom nil)))
+    (Client. node (atom nil)
+             (and (:neighbors test) (odd? (swap! neighbor-counter inc)))))
 
   (setup! [_ test])
 
   (invoke! [_ test op]
-    (pc/run-txn! test node conn op
-                 (fn [c] (mapv (partial mop! c) (:value op)))))
+    (if neighbor?
+      (neighbor! test node conn op)
+      (pc/run-txn! test node conn op
+                   (fn [c] (mapv (partial mop! c) (:value op))))))
 
   (teardown! [_ test])
 
@@ -50,9 +76,12 @@
 
 (defn workload
   [opts]
-  (assoc (append/test {:key-count          10
-                       :min-txn-length     1
-                       :max-txn-length     4
-                       :max-writes-per-key 32
-                       :consistency-models [(consistency-model (:isolation opts))]})
-         :client (Client. nil nil)))
+  (let [w (append/test {:key-count          10
+                        :min-txn-length     1
+                        :max-txn-length     4
+                        :max-writes-per-key 32
+                        :consistency-models [(consistency-model (:isolation opts))]})]
+    (assoc w
+           :client  (Client. nil nil false)
+           :checker (checker/compose {:elle      (:checker w)
+                                      :isolation (pc/isolation-checker)}))))

@@ -1,0 +1,12 @@
+# C1 x C2 with a mixed pool: half the clients run append with the isolation
+# level set per session through JDBC (setTransactionIsolation, as Spring's
+# @Transactional(isolation=...) and HikariCP's transactionIsolation do); the
+# other half are "neighbors" sharing the same pool that set READ COMMITTED the
+# same way. Against Postgres directly the append clients get the level they
+# asked for; through PgDog the question is whether they still do.
+-w append --isolation serializable    --isolation-mode session --neighbors --concurrency 10 --time-limit 120
+-w append --isolation serializable    --isolation-mode session --neighbors --concurrency 10 --time-limit 120 --control
+-w append --isolation repeatable-read --isolation-mode session --neighbors --concurrency 10 --time-limit 120
+-w append --isolation repeatable-read --isolation-mode session --neighbors --concurrency 10 --time-limit 120 --control
+# Same mix, isolation set per transaction (SET TRANSACTION): should be immune.
+-w append --isolation serializable    --isolation-mode txn     --neighbors --concurrency 10 --time-limit 120

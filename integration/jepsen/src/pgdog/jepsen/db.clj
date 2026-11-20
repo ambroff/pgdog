@@ -22,6 +22,9 @@
 (def database "jepsen")
 (def pg-port 5432)
 (def pgdog-port 6432)
+;; PgDog's admin database. The admin user doesn't need to be in users.toml.
+(def admin-database "admin")
+(def admin-user "admin")
 
 ;; ---------------------------------------------------------------------------
 ;; Postgres
@@ -133,6 +136,8 @@
                           "host = \"0.0.0.0\""
                           (str "port = " pgdog-port)
                           (str "default_pool_size = " (:pool-size test))
+                          (str "pooler_mode = " (toml-str (name (:pooler-mode test))))
+                          (str "query_parser = " (toml-str (name (:query-parser test))))
                           (str "two_phase_commit_wal_dir = " (toml-str pgdog-wal))]
                    (:two-pc test)
                    (conj "two_phase_commit = true")
@@ -162,7 +167,10 @@
                      (str "database = " (toml-str database))
                      "name = \"append\""
                      "column = \"k\""]])
-        admin    ["[admin]" (str "password = " (toml-str password))]]
+        admin    ["[admin]"
+                  (str "name = " (toml-str admin-database))
+                  (str "user = " (toml-str admin-user))
+                  (str "password = " (toml-str password))]]
     (->> (concat [general] dbs sharding [admin])
          (map #(str/join "\n" %))
          (str/join "\n\n"))))

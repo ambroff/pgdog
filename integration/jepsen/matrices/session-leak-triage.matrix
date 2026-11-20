@@ -1,0 +1,13 @@
+# Session-leak triage: each way of setting session state on its own, no
+# faults, so a broken mechanism can't mask or cause failures in another.
+# Tracked by PgDog (SET / RESET / startup options):
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,set,startup
+# Untracked candidates, one at a time:
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,set-config
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,set-config-bind
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,characteristics
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,jdbc
+# With the full query parser, set_config('..', '<literal>', ..) should be seen:
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,set-config --query-parser on
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,set-config-bind --query-parser on
+-w session-leak --concurrency 20 --time-limit 30 --session-mechanisms reset,characteristics --query-parser on
