@@ -321,6 +321,7 @@ integration/jepsen/
 | =shard-move=         | custom                              | C7            | Every logical row exists exactly once; no lost value updates                     |
 | =unique-ids=         | =checker/unique-ids=                | C8            | No duplicate IDs across nodes and restarts                                       |
 | =session-leak=       | custom                              | C2, H9        | Each txn reports the =transaction_isolation= its client asked for                |
+| =register=           | Elle rw-register (=cycle.wr=)       | C1, C7, H6    | Same models as =append=; covers overwrites, which list-append cannot            |
 | =rw-split=           | custom register + LSN probes        | C9            | Writes only on primary; read staleness ≤ =ban_replica_lag= + check interval     |
 | =failover=           | Elle list-append / rw-register      | C10, H8       | No G0/lost acked writes attributable to PgDog (sync replication isolates PgDog's part) |
 | =reshard=            | Elle list-append across =RESHARD=   | C11, H10      | No lost acked appends; nothing written to the old cluster after cutover is lost  |
@@ -348,6 +349,7 @@ integration/jepsen/
 | partition PgDog ↔ one shard         | network          | =jepsen.net= iptables                                  | C4, C5, H4       |
 | partition client ↔ PgDog            | network          | iptables on n1/n2                                      | C5 (client vanishes mid-2PC) |
 | kill / pause shard                  | Postgres         | =pg_ctl stop -m immediate=, SIGSTOP                    | C4, C5           |
+| kill backend                        | Postgres         | =pg_terminate_backend= on PgDog's server conns; SIGKILL one backend | C1, C2, H4 |
 | lose unfsynced writes               | PgDog WAL dir    | =jepsen.lazyfs= mounted at =two_phase_commit_wal_dir=  | H3               |
 | clock bump / strobe                 | PgDog nodes      | =jepsen.nemesis.time=                                  | C8, H7           |
 | promote replica                     | Postgres         | =pg_ctl promote=, optionally after isolating primary   | C10, H8          |
@@ -446,9 +448,62 @@ Notes:
   even though the bug was present: Elle needs the weaker txn to hit a
   conflicting interleaving. The isolation checker catches every case.
 
+** TODO M1b: Plain pooler, server-side faults and Jepsen PostgreSQL 12.3 follow-ups (C1, C2, H4)
+M1 only faulted PgDog and the client side. Ideas taken from Jepsen's
+PostgreSQL 12.3 analysis ([[https://jepsen.io/analyses/postgresql-12.3]]):
+- *Backend faults.* Jepsen killed Postgres processes in random order. A
+  pooler sees the same faults as dead server connections. Add a nemesis that:
+  - terminates PgDog's server connections with =pg_terminate_backend=,
+    choosing them from =pg_stat_activity= by =client_addr= (the PgDog nodes);
+  - SIGKILLs one random backend, which makes the postmaster restart every
+    session (crash recovery);
+  - runs =pg_ctl stop -m immediate=, then a restart.
+
+  Look for:
+  - a statement or =COMMIT= that PgDog silently replays on a new server
+    connection;
+  - acked appends lost, or G1a;
+  - an error ending up on a client other than the one whose backend died;
+  - a pool that never recovers;
+  - =session-leak= mismatches after the server connection is replaced.
+
+  Errors during =COMMIT= must surface as indeterminate (=:info=); see H4.
+- *Stronger models.* On a single node, Jepsen found RR histories "consistent
+  with strong snapshot isolation". So with one Postgres behind PgDog, check
+  =:strong-snapshot-isolation= at RR and =:strict-serializable= at SER. Both
+  add Elle's real-time edges. PgDog is the component most likely to break
+  real-time order, e.g. by acking before the server does or by serving a
+  stale connection. First re-check the existing M1 histories offline, then
+  make these the defaults where they apply (not across shards or replicas).
+- *Write and read paths.* Jepsen's append test:
+  - spread keys over several tables, chosen by hash of the key;
+  - had a second append path besides =INSERT ... ON CONFLICT DO UPDATE=:
+    =UPDATE=, check the row count, =INSERT=, then =UPDATE= again on a unique
+    violation;
+  - read some keys by an unindexed secondary key, which forces a table scan.
+
+  Each of these sends a statement down a different PgDog parser/router path.
+  Add them as =append= options: =--tables N=, =--append-path
+  upsert|update-insert=, =--read-by pk|sk|mixed=.
+- *Fresh inserts.* Every instance of the SSI bug involved an rw-conflict on
+  a freshly inserted row, so keep keys rotating. Lower
+  =:max-writes-per-key= (32 now) so new rows keep getting inserted.
+- *Contention sweep.* Jepsen: "High-contention workloads are especially
+  susceptible." Sweep =key-count=, =concurrency= and =--pool-size= (pool ≪
+  clients) for =append= with =--neighbors=, and record the anomaly rate.
+  That tells us how short a run can still be a useful regression test for F1.
+Exit: same as M1: identical to the control, or anomalies triaged.
+
 ** TODO M2: Sharded, direct-to-shard (C3)
 - 3 shards, list mapping, every txn touches one shard.
-- Same nemeses as M1 plus shard kill/partition.
+- Same nemeses as M1 plus shard kill/partition, plus the backend faults from
+  M1b.
+- Use the M1b =append= variants here as well. A read by secondary key
+  (=--read-by sk=) has no shard key, so PgDog broadcasts it to every shard
+  and merges the results: a cross-shard read path inside an otherwise
+  single-shard txn. Track those results separately from the direct-to-shard
+  results.
+- Check the per-shard histories against the strong models from M1b.
 Exit: per-shard Elle results match the Postgres control.
 
 ** TODO M3: Cross-shard 2PC (C4, C5, C12, H1–H5). The main event.
@@ -468,6 +523,10 @@ findings report.
 ** TODO M4: Query rewrites (C6, C7, H6)
 - =multi-insert= and =shard-move= with 2PC off/on, under kill and partition
   nemeses.
+- Add an Elle =rw-register= workload (=jepsen.tests.cycle.wr=) for C7.
+  List-append only appends; Jepsen's 12.3 analysis names that as a coverage
+  gap. A shard-key move is an overwrite, so it needs a register workload for
+  Elle to see lost updates and duplicated versions (H6).
 
 ** TODO M5: Unique IDs (C8, H7)
 - 2 PgDog nodes with distinct =NODE_ID=; both =Standard= and =Compact=
@@ -672,6 +731,12 @@ nor =set_config()= is listed as a limitation.
 - Which edition/version is in scope? Some features (e.g. automatic
   =RESHARD= cutover) may be EE-only. Does the Aura contract give access to EE
   builds?
-- Postgres versions to cover (the oldest supported plus latest?).
+- Postgres versions to cover (the oldest supported plus latest?). Every
+  version before the August 2020 minor releases (12.4, 11.9, 10.14, 9.6.19,
+  9.5.23) has the SSI bug from Jepsen's 12.3 analysis: G2-item at
+  SERIALIZABLE with no faults. On those versions the control itself fails.
+  The bug's signature is the same as F1's at SERIALIZABLE, so a PgDog
+  anomaly must always be attributed through the control and
+  =isolation-checker=, never through Elle alone.
 - Ask the PgDog devs during triage: is =NODE_ID= meant to be required for 2PC
   (see H1/D4)? The docs don't say so either way.
