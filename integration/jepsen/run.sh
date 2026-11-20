@@ -20,5 +20,9 @@ incus_cmd bash "$SCRIPT_DIR/nodes.sh" up
 cd "$SCRIPT_DIR"
 COMMON=(--nodes n1,n2,n3,n4,n5 --concurrency 10 --time-limit 60 --pgdog-bin "$REPO_ROOT/target/release/pgdog")
 
-lein run test "${COMMON[@]}" --control "$@"
-lein run test "${COMMON[@]}" "$@"
+# Run both even if the control fails; Jepsen exits 1 for invalid, 2 for
+# unknown (e.g. a checker crashed).
+status=0
+lein run test "${COMMON[@]}" --control "$@" || status=$?
+lein run test "${COMMON[@]}" "$@" || { s=$?; ((s > status)) && status=$s; }
+exit "$status"

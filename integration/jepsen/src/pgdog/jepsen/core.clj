@@ -70,12 +70,13 @@
         wrap     (or (:wrap-generator workload) identity)]
     (merge tests/noop-test
            opts
-           {:name      (str "pgdog " (name (:mode opts))
-                            " " (name (:workload opts))
-                            " " (name (:isolation opts))
-                            (when (:control opts) " control")
-                            (when (seq (:nemesis opts))
-                              (str " " (str/join "," (map name (:nemesis opts))))))
+           ;; No spaces: this becomes the store/ directory name.
+           {:name      (str/join "-"
+                                 (cond-> ["pgdog" (name (:mode opts))
+                                          (name (:workload opts))
+                                          (name (:isolation opts))]
+                                   (:control opts)       (conj "control")
+                                   (seq (:nemesis opts)) (conj (str/join "+" (map name (:nemesis opts))))))
             :os        debian/os
             :db        db
             :client    (role/restrict-client :pgdog (:client workload))

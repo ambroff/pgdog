@@ -358,16 +358,35 @@ these windows.
 * Milestones
 
 ** TODO M0: Harness bring-up
-- [ ] Incus installed; Docker =DOCKER-USER= rules in place for =incusbr0=
-- [ ] =nodes.sh up= creates n1–n5 VMs; the host can SSH to all of them as
+- [X] Incus installed; Docker =DOCKER-USER= rules in place for =incusbr0=
+- [X] =nodes.sh up= creates n1–n5 VMs; the host can SSH to all of them as
       root; =/etc/hosts= is consistent; =clean= snapshots exist
-- [ ] =nodes.sh reset= restores a deliberately broken node
-- [ ] JDK + Leiningen on the host; Jepsen's =lein run test --nodes n1,...=
+- [X] =nodes.sh reset= restores a deliberately broken node (~40 s for all 5)
+- [X] JDK + Leiningen on the host; Jepsen's =lein run test --nodes n1,...=
       reaches every node
-- [ ] =db.clj= installs Postgres on n3–n5, uploads and starts PgDog on n1–n2
-- [ ] =append= with a noop nemesis passes against raw Postgres and through PgDog
-- [ ] =integration/jepsen/run.sh= runs a 60 s smoke test
+- [X] =db.clj= installs Postgres and uploads and starts PgDog on n1–n2
+      (verified in pooler mode, Postgres on n3 only; sharded mode on n3–n5
+      is first exercised in M2)
+- [X] =append= with a noop nemesis passes against raw Postgres and through
+      PgDog (Elle =:valid? true= for both; 30 s runs, ~2.7k ok txns, no
+      =:info= ops)
+- [X] =integration/jepsen/run.sh= runs a 60 s smoke test (control: 5666 ok /
+      333 fail / 0 info; PgDog: 5344 ok / 363 fail / 0 info; Elle valid for
+      both)
+- [X] =gnuplot= on the host (the perf checker needs it; without it the overall
+      verdict is =:unknown= even when Elle passes)
 Exit: green noop run through PgDog; =store/= has logs from every node.
+
+Bring-up notes:
+- The Incus Debian cloud image locks root (cloud-init default) and ships an
+  =sshd_config= without =Subsystem sftp= or an =Include= of
+  =sshd_config.d=; =cloud-init.yaml= fixes both.
+- Restoring a snapshot gives the VM a new cloud-init instance-id, so
+  cloud-init re-runs unless disabled; provisioning ends by touching
+  =/etc/cloud/cloud-init.disabled=.
+- The incus 6.0.4 client hung twice (=init=, =snapshot create= on a running
+  VM) with no server operation pending. =nodes.sh= now wraps both in
+  =timeout= and snapshots stopped VMs.
 
 ** TODO M1: PgDog as a plain pooler (C1, C2)
 - Single Postgres, transaction pooling, pool much smaller than client count

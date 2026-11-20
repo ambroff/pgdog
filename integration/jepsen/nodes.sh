@@ -56,12 +56,19 @@ hosts_block() {
     for n in $(nodes); do echo "$(ip_of "$n") $n"; done
 }
 
+# SSH as root, ignoring known_hosts (rebuilt nodes have new host keys; they
+# are re-recorded at the end of `up`).
+node_ssh() {
+    local n=$1; shift
+    ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=3 \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR "root@$n" "$@"
+}
+
 wait_ssh() {
     local n=$1
     for _ in $(seq 1 60); do
-        if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=3 \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "root@$n" true 2>/dev/null; then
+        if node_ssh "$n" true 2>/dev/null; then
             return 0
         fi
         sleep 2
@@ -87,8 +94,13 @@ up() {
             continue
         fi
         echo "creating $n ($(ip_of "$n"))"
-        incus init "$IMAGE" "$n" "${vm_flag[@]}" "${limits[@]}" \
-            -c cloud-init.user-data="$user_data"
+        # The incus client occasionally hangs after the daemon has finished
+        # (seen once: 2h stuck with no operation pending); fail instead.
+        timeout 900 incus init "$IMAGE" "$n" "${vm_flag[@]}" "${limits[@]}" \
+            -c cloud-init.user-data="$user_data" </dev/null || {
+            echo "$n: incus init failed or timed out" >&2
+            exit 1
+        }
         incus config device override "$n" eth0 ipv4.address="$(ip_of "$n")"
         incus start "$n"
     done
@@ -103,7 +115,7 @@ up() {
         }
         hosts_block | incus exec "$n" -- tee /etc/hosts >/dev/null
         wait_ssh "$n"
-        ssh -i "$SSH_KEY" -o BatchMode=yes "root@$n" test -e /etc/cloud/cloud-init.disabled || {
+        node_ssh "$n" test -e /etc/cloud/cloud-init.disabled || {
             echo "$n: cloud-init did not finish provisioning (no /etc/cloud/cloud-init.disabled)" >&2
             exit 1
         }
@@ -113,12 +125,20 @@ up() {
     for n in $(nodes); do ssh-keygen -R "$n" >/dev/null 2>&1 || true; done
     for n in $(nodes); do ssh-keyscan -t rsa,ed25519 "$n" 2>/dev/null; done >>"$HOME/.ssh/known_hosts"
 
+    # Snapshot stopped VMs: the disk image is then consistent, and we avoid an
+    # intermittent client hang seen when snapshotting running VMs.
     for n in $(nodes); do
         if ! incus snapshot show "$n" "$SNAPSHOT" >/dev/null 2>&1; then
             echo "snapshotting $n"
-            incus snapshot create "$n" "$SNAPSHOT"
+            incus stop "$n"
+            timeout 300 incus snapshot create "$n" "$SNAPSHOT" </dev/null || {
+                echo "$n: snapshot failed or timed out" >&2
+                exit 1
+            }
+            incus start "$n"
         fi
     done
+    for n in $(nodes); do wait_ssh "$n"; done
     echo "nodes ready: $(nodes | paste -sd, -)"
 }
 
