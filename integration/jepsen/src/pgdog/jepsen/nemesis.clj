@@ -397,7 +397,7 @@
       (if (:control test)
         (assoc op :value :skipped-control)
         (assoc op :value (into (sorted-map)
-                               (map (fn [node] [node (pool-stats! node 15000)]))
+                               (map (fn [node] [node (pool-stats! node (* 1000 (:drain-timeout test 15)))]))
                                (role/nodes test :pgdog)))))
 
     (teardown! [_ test])))
@@ -439,8 +439,10 @@
                (cond-> {:shard (db/shard-index test node)
                         :xacts (xacts conn)}
                  rows?
-                 (assoc :rows (vec (for [t   (db/append-tables test)
-                                         row (j/execute! conn [(str "SELECT k, v FROM " t " ORDER BY k")]
+                 (assoc :rows (vec (for [t   (db/dump-tables test)
+                                         row (j/execute! conn [(str "SELECT k, "
+                                                                    (if (= db/bank-table t) "balance" "v")
+                                                                    " AS v FROM " t " ORDER BY k")]
                                                          {:builder-fn rs/as-unqualified-maps})]
                                      [(:k row) (:v row)])))))
              (catch Exception e

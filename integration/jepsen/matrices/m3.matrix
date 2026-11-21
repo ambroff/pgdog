@@ -1,0 +1,63 @@
+# M3: cross-shard 2PC (C4, C5, C12, H1-H5). PgDog on n1/n2, shards on
+# n3/n4/n5. Every row: --cross-shard append (keys spread over the shards, most
+# txns span 2-3) or bank (80% of transfers cross shards), pool size 20 so no
+# client waits for a connection (keeps F7 out), Postgres lock_timeout 3 s
+# (cross-shard deadlocks are invisible to Postgres).
+#
+# Run: bash matrix.sh matrices/m3.matrix
+# Deterministic phase-window reproducers: repro/two_pc.sh.
+
+# --- No faults. 2PC off rows validate the checkers (SER: commit-time 40001 on
+# one shard can leave the other committed) ---
+--mode sharded -w append --cross-shard --two-pc --isolation serializable    --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+--mode sharded -w append --cross-shard --two-pc --isolation repeatable-read --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+--mode sharded -w append --cross-shard --two-pc --isolation read-committed  --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+--mode sharded -w append --cross-shard          --isolation serializable    --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+--mode sharded -w bank --two-pc --isolation serializable --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+--mode sharded -w bank          --isolation serializable --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120
+
+# --- Protocols (H5): simple, named prepared statements, SET TRANSACTION mode
+# (pgjdbc autocommit off + Connection.commit) ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --query-mode simple
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --prepare-threshold 1
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --isolation-mode txn
+
+# --- C12: an error inside the txn, then COMMIT anyway ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --inject-errors 0.2
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --inject-errors 0.2 --inject-error-kind syntax
+--mode sharded -w append --cross-shard          --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --inject-errors 0.2 --inject-error-kind syntax
+--mode sharded -w bank --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --inject-errors 0.2 --inject-error-kind mixed
+
+# --- Autocommit cross-shard writes (two_phase_commit_auto, D1) ---
+--mode sharded -w bank --two-pc                      --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --auto-frac 0.5
+--mode sharded -w bank --two-pc --two-pc-auto true   --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --auto-frac 0.5
+--mode sharded -w bank --two-pc --two-pc-auto true   --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --auto-frac 0.5 --nemesis kill-postgres,pause-postgres
+
+# --- PgDog crashes (C5, H1, H2, H3) ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog --no-node-id
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog --wal-mode wipe
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog --wal-mode lazyfs
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog --wal-mode lazyfs --wal-fsync-interval 100
+--mode sharded -w append --cross-shard          --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis pause-pgdog
+--mode sharded -w bank --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog
+--mode sharded -w bank --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog --no-node-id
+--nodes n1,n3,n4,n5 --pgdog-count 1 --mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-pgdog
+
+# --- Client side: clients vanish mid-COMMIT ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis partition-clients
+
+# --- Shard faults (C4, H4). Default classification (COMMIT errors :info)
+# must be valid; --strict-commit-errors shows H4 (an error on COMMIT, yet
+# committed) ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-postgres
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis pause-postgres
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis partition
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 4
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 180 --nemesis terminate-backend,kill-backend,restart-postgres --nemesis-interval 4 --strict-commit-errors
+--mode sharded -w append --cross-shard          --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-postgres
+--mode sharded -w bank --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis kill-postgres,pause-postgres,partition
+
+# --- Everything at once, 20 s interval ---
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 240 --nemesis-interval 20 --nemesis kill-pgdog,pause-pgdog,partition-clients,partition,kill-postgres,pause-postgres,terminate-backend,kill-backend,restart-postgres

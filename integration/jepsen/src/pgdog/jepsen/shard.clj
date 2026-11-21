@@ -146,3 +146,11 @@
                              (str/join ", " (map #(+ (* s base) %) (range (:list-size test))))
                              "]")])
                      (range n)))))
+
+(defn global-key
+  "--cross-shard: key j of one Elle key space spread over every shard,
+  round-robin: j lives on shard (mod j n), as that shard's (quot j n)-th key.
+  A txn over several keys then usually spans several shards."
+  [test j]
+  (let [n (shard-count test)]
+    (key-of test (mod j n) (quot j n))))

@@ -190,6 +190,32 @@
       (throw (ex-info "probe found no row: statement routed to the wrong shard"
                       {:type :probe-misrouted, :sql sql, :params params}))))
 
+(defn inject-error!
+  "C12: makes the open txn fail with an error, then the caller sends COMMIT
+  anyway. --inject-error-kind:
+  - :server  a statement routed to shard s by key that Postgres rejects
+             (division by zero, 22012);
+  - :syntax  a statement with a syntax error (42601). With sharding on,
+             PgDog parses every statement and answers this one itself.
+  - :mixed   either, per txn.
+  Returns [kind s sqlstate], or throws if the statement unexpectedly
+  succeeded or failed some other way (e.g. the connection died), so
+  run-txn! classifies that like any other error."
+  [test conn s]
+  (let [kind (let [k (:inject-error-kind test :server)]
+               (if (= :mixed k) (rand-nth [:server :syntax]) k))
+        [sql want] (case kind
+                     :server [(str "SELECT 1/0 AS x FROM " db/probe-table " WHERE k = ?") "22012"]
+                     :syntax [(str "SELEC 1 AS x FROM " db/probe-table " WHERE k = ?") "42601"])
+        e (try (j/execute! conn [sql (shard/anchor test s)])
+               nil
+               (catch SQLException e e))]
+    (when-not e
+      (throw (ex-info "injected error did not fail" {:type :inject-error-missed, :shard s, :kind kind})))
+    (when-not (= want (sql-state e))
+      (throw e))
+    [kind s (sql-state e)]))
+
 (defn run-txn!
   "Runs (f conn) inside a transaction at the test's isolation level, and
   completes `op`. Returns the completed op. Reconnects lazily: on a connection
@@ -236,18 +262,35 @@
         ;; Record the level the server actually runs this txn at, so a
         ;; txn that silently ran at a weaker level shows up even when Elle
         ;; finds no anomaly (see isolation-checker).
-        (let [row   (probe! test conn start-sql params)
-              _     (vreset! pid (:pid row))
-              _     (vreset! bnode (:node row))
-              value (f conn)
-              end   (probe! test conn end-sql params)]
+        (let [row      (probe! test conn start-sql params)
+              _        (vreset! pid (:pid row))
+              _        (vreset! bnode (:node row))
+              value    (f conn)
+              injected (when-let [s (:inject-error op)] (inject-error! test conn s))
+              end      (when-not injected (probe! test conn end-sql params))]
           (vreset! phase :commit)
-          (if (= :begin mode)
-            (j/execute! conn ["COMMIT"])
-            (.commit conn))
-          (cond-> (assoc op :type :ok, :value value, :isolation-seen (:iso row)
-                         :backend-pid @pid, :backend-pid-end (:pid end))
-            (:node row) (assoc :backend-node (:node row), :backend-node-end (:node end)))))
+          (if injected
+            ;; C12: the txn has an error on shard s, and the client sends
+            ;; COMMIT anyway. Postgres answers ROLLBACK; no shard may commit
+            ;; its part, so the op is a definite :fail whatever COMMIT says.
+            (let [commit (try (if (= :begin mode)
+                                (j/execute! conn ["COMMIT"])
+                                (.commit conn))
+                              :no-error
+                              (catch SQLException e
+                                [(error-type e) (.getMessage e)]))]
+              ;; Whatever went wrong, start the next txn on a fresh connection.
+              (when (vector? commit)
+                (close! conn) (reset! conn-atom nil))
+              (cond-> (assoc op :type :fail, :error [:injected-error injected]
+                             :commit-result commit, :backend-pid @pid)
+                @bnode (assoc :backend-node @bnode)))
+            (do (if (= :begin mode)
+                  (j/execute! conn ["COMMIT"])
+                  (.commit conn))
+                (cond-> (assoc op :type :ok, :value value, :isolation-seen (:iso row)
+                               :backend-pid @pid, :backend-pid-end (:pid end))
+                  (:node row) (assoc :backend-node (:node row), :backend-node-end (:node end)))))))
       (catch Throwable e
         (let [conn @conn-atom]
           ;; A workload abort (ex-info) is not a lost connection: roll back
@@ -303,6 +346,9 @@
   SQLSTATE 58000 (\"net: io: ...\"), not as Postgres' 57P01/57P02."
   [{:keys [error]}]
   (let [[_ type msg] error
+        ;; C12 injected errors carry [:injected-error [kind s sqlstate]]:
+        ;; not a connection loss.
+        type  (when (keyword? type) type)
         state (some->> type name (re-find #"^sqlstate-(.*)$") second)]
     (or (and (string? msg) (re-find termination-error msg))
         (= "58000" state)
@@ -398,17 +444,24 @@
   #{:terminate-backend :kill-backend :restart-postgres :kill :pause :start-partition
     :start-client-partition :reconnect :reload :pause-pool})
 
+(def lingering-faults
+  "Connection faults that can leave dead idle server connections in PgDog's
+  pools, to be handed to a txn at any later time."
+  #{:terminate-backend :kill-backend :restart-postgres})
+
 (defn may-fan-out?
   "Can a txn in this test hold server connections on shards other than its
   own? Through PgDog in sharded mode, SET TRANSACTION / SET SESSION
   CHARACTERISTICS, SAVEPOINT / RELEASE / ROLLBACK TO and reads by sk go to
   every shard, and with --jdbc-builder qualified pgjdbc's catalog lookups go
   to the client's sticky shard. Only BEGIN-mode txns with primary-key reads
-  and upserts, and no metadata lookups, stay on one shard."
+  and upserts, and no metadata lookups, stay on one shard. --cross-shard
+  txns span shards by design."
   [test]
   (and (= :sharded (:mode test))
        (not (:control test))
-       (or (not= :begin (:isolation-mode test))
+       (or (:cross-shard test)
+           (not= :begin (:isolation-mode test))
            (not= :pk (:read-by test))
            (not= :upsert (:append-path test))
            ;; pgjdbc metadata lookups go to the client's sticky shard
@@ -446,11 +499,22 @@
            (some (fn [[f s]] (and (connection-faults f) (<= s t1))) windows))
       :before-first-statement
 
+      ;; Only a fault on another node this txn used (all Postgres nodes if
+      ;; the op doesn't say), and only while it could matter: faults that
+      ;; leave dead idle server connections behind at any time before the
+      ;; txn ended, others only if they overlapped it.
       (and (may-fan-out? test)
-           (some (fn [[f s _ v]]
-                   (and (connection-faults f) (<= s t1)
-                        (not= (:node v) (:backend-node op))))
-                 windows))
+           (let [parts (if-let [ss (seq (:shards op))]
+                         (set (map #(shard-node test %) ss))
+                         (set (role/nodes test :postgres)))]
+             (some (fn [[f s e v]]
+                     (let [n (:node v)]
+                       (and (connection-faults f) n (parts n)
+                            (not= n (:backend-node op))
+                            (<= s t1)
+                            (or (lingering-faults f)
+                                (<= t0 (+ e heal-grace-nanos))))))
+                   windows)))
       :fan-out-fault
 
       :else

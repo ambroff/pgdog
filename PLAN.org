@@ -88,6 +88,11 @@ confirms or rules it out.
   in the WAL; refuse to start with 2PC on and =NODE_ID= unset; or have
   recovery also scan =pg_prepared_xacts= for this deployment's prefix.
 - Test: kill nemesis on PgDog with and without =NODE_ID=; orphan checker.
+- *Confirmed in M3* (F9). One correction: the orphans come only from txns
+  the client was never acked for (PgDog acks after phase 2 completes), so
+  no acked write is lost. What is lost is atomicity (a txn killed in phase 2
+  stays committed on some shards and prepared forever on the others) and
+  liveness (the orphans hold their row locks and SIREAD locks for good).
 
 ** H2: The 2PC WAL is lost along with the PgDog node
 - Each PgDog instance has its own WAL. Nothing else scans
@@ -97,6 +102,8 @@ confirms or rules it out.
   its in-doubt txns are orphaned for good.
 - Test: kill a PgDog node and bring it back with an empty WAL dir. Also kill
   one node permanently while a second node keeps serving traffic.
+- *Confirmed in M3* (F10): same outcomes as H1. The second PgDog never
+  touches the first one's gids.
 
 ** H3: WAL durability depends on the fsync settings
 - =two_phase_commit_wal_fsync_interval= defaults to 0 (flush and fsync on
@@ -105,6 +112,12 @@ confirms or rules it out.
   could be acked to the protocol and lost on a power failure.
 - Test: LazyFS under the WAL dir with "lose unfsynced writes" plus a PgDog
   kill, at fsync interval 0 and at 100 ms.
+- *Refuted as worded* (M3). A non-zero interval is group commit:
+  =wait_flush()= returns only after the =sync_data()= that covers the record
+  (=wal/live_segment.rs:211-252=), so no record is acked before its fsync.
+  The LazyFS runs at 0 and 100 ms were valid (0 orphans, 0 partial). The
+  real durability hole is next to it: WAL write and fsync *errors* are
+  swallowed and the txn proceeds as if the record were durable (F11).
 
 ** H4: Error on =COMMIT= does not mean "not committed"
 - =end_two_pc= returns an error if phase 2 fails partway, e.g. the
@@ -119,6 +132,11 @@ confirms or rules it out.
 - M1b: already true without 2PC. A lost server connection during =COMMIT=
   reaches the client as =FATAL 58000=, and some of those txns committed
   (F5). The 2PC form (=end_two_pc=) is still for M3.
+- *Confirmed in M3* for 2PC (F13): a lost server connection during
+  =COMMIT PREPARED= reaches the client as =FATAL 58000=, and the 2PC manager
+  then commits the txn on every shard. The docs do say phase-2 errors end in a commit, but the client
+  cannot tell a phase-2 error from a phase-1 one (rolled back): both are
+  =FATAL 58000= or the server's own error.
 
 ** H5: When 2PC actually kicks in
 - 2PC runs only if =two_pc_enabled() && route.is_write() && !rollback &&
@@ -133,6 +151,17 @@ confirms or rules it out.
   - Extended protocol vs. simple protocol =COMMIT=.
 - Test: run every cross-shard workload under both protocols, with
   =two_phase_commit_auto= on and off.
+- *Resolved in M3.* Simple, extended and named-prepared protocols and
+  =SET TRANSACTION= mode all go through 2PC and hold (valid). The gaps are
+  elsewhere:
+  - =two_phase_commit_auto= is off by default (D1), and then a cross-shard
+    autocommit write is not atomic (F15).
+  - =transaction.write()= only means "not =BEGIN READ ONLY=", so read-only
+    txns spanning shards also run 2PC (N3).
+  - =COMMIT AND CHAIN= is parsed as a plain =COMMIT=; under 2PC the chain is
+    lost (F14).
+  - PgDog-generated errors don't mark the txn failed, so the =COMMIT= after
+    them takes the 2PC path and commits (F8, C12).
 
 ** H6: Concurrent shard-key updates can duplicate rows
 - The rewrite runs SELECT, INSERT (new shard), DELETE (old shard). I found
@@ -218,9 +247,15 @@ the findings report.
 | D3 | =two_phase_commit_wal_checkpoint_interval= default | general settings page: =60= (s); crash-recovery page: =15_000= ms | =15_000= ms (=pgdog-config/src/general.rs:1202=)              |
 | D4 | =NODE_ID= and 2PC                           | not mentioned                                                         | gid depends on it (see H1)                                     |
 | D5 | Clock requirements for =unique_id=          | none stated                                                           | code assumes "reasonably accurate and synchronized" clocks    |
+| D6 | =two_phase_commit_wal_dir= default          | general settings page: =./pgdog_wal=; crash-recovery page: an example path, no default | =None= unless =PGDOG_TWO_PHASE_COMMIT_WAL_DIR= is set (=pgdog-config/src/general.rs:1190-1192=); PgDog only logs =[2pc] wal disabled, 2pc will run without crash recovery= (=pgdog/src/main.rs:226=). In-process cleanup still works; recovery across a crash or restart doesn't |
+| D7 | 2PC WAL format (=docs/CLIENT_CONNECTION.md:209=) | records =Begin= / =Committing= / =End=; framing =u32 bodylen LE \vert u32 crc32c LE \vert u8 tag \vert rmp-serde body= | records identity =i=, phase =2=, remove =r= (=two_pc/wal/record/records.rs:39-46=), framed =code \vert i32 length \vert data= with hand-encoded bodies and no checksum (=record/mod.rs:18-58=; the WAL README says "We didn't add checksums") |
+| D8 | Crash recovery behaviour (crash-recovery page; also =two_pc/wal/README.md:21=) | recovery "doesn't perform any writes to disk"; "Clients will not be able to connect until recovery is complete" | recovery deletes segments with an incomplete header (=wal/recovery.rs:96-111=), creates a new segment (146-152), and writes =r= records as it resolves txns. WAL replay does finish before the listener starts (=main.rs:211-231=), but /resolving/ the in-doubt txns runs in the background afterwards: in M3 clients ran txns while recovered txns were still being committed or rolled back (n1, =...-wal-lazyfs-fsync100-.../2026-11-20T13:20:06=, 21:20:36Z) |
+| D9 | Read-only txns and 2PC (2PC page)           | "Read transactions are finished using normal =COMMIT= statements"   | with =two_phase_commit= on, any txn that touched more than one shard and was not started =READ ONLY= is finished with =PREPARE= / =COMMIT PREPARED= (N3) |
 
 D1 matters for the test matrix: a user who reads the general settings page
 believes cross-shard autocommit writes are atomic by default. They aren't.
+M3 confirmed D1's consequence (F15) and D4 (F9). Neither 2PC page mentions
+=NODE_ID=, WAL write errors, distributed deadlocks or =COMMIT AND CHAIN=.
 
 * Test environment
 
@@ -795,7 +830,7 @@ Notes:
 - xacts/txn reads =pg_stat_database=, which a crash restart resets, and
   counts neighbor queries; use it only from no-fault runs.
 
-** TODO M3: Cross-shard 2PC (C4, C5, C12, H1–H5). The main event.
+** DONE M3: Cross-shard 2PC (C4, C5, C12, H1–H5). The main event.
 Matrix (prune once the results stabilise):
 - =two_phase_commit=: off (expected to fail atomicity, which validates the
   checker) / on
@@ -808,6 +843,89 @@ Matrix (prune once the results stabilise):
 Workloads: x-shard =append=, =bank=, plus the error-injection op for C12.
 Exit: every hypothesis H1–H5 confirmed or refuted, and each written up in the
 findings report.
+
+Done 2026-11-20. Matrices: =matrices/m3.matrix= (35 runs;
+=store/matrix-20261120T122054.tsv=), =matrices/m3-followup.matrix= (4;
+=store/matrix-20261120T140709.tsv=). Every M3 run re-checked with the final checker code
+(=lein run recheck-workload=; only row 1 changed, from =:unknown= to valid).
+Deterministic repros: =repro/two_pc.sh=, all scenarios archived in
+=store/repro-2pc-20261120T142512/=.
+
+*Hypotheses:* H1 confirmed (F9), H2 confirmed (F10), H3 refuted as worded
+(group commit never acks before the fsync; WAL errors are the real hole,
+F11), H4 confirmed for 2PC (F13), H5 resolved (protocols fine; gaps F8,
+F14, F15, N3). See each hypothesis above.
+
+*C4 holds for explicit multi-shard txns (=BEGIN= ... =COMMIT=), unless the
+client sends =COMMIT= after a PgDog-generated error (F8) or uses
+=COMMIT AND CHAIN= (F14).* Autocommit statements and pipelines are not
+covered without auto 2PC (F15) or at all (F16), and a failed =COMMIT= may
+have committed (F13). With 2PC on: atomic (no partial
+txn, no acked txn lost, no failed txn visible) at SER, RR and RC, in simple,
+extended, named-prepared and =SET TRANSACTION= modes, for append and bank,
+and under every Postgres-side fault (kill, pause, partition,
+terminate/kill-backend, restart) with the default =COMMIT= classification.
+The checkers catch the failures when 2PC is off (rows 4, 6, 22, 33: partial
+txns, G1a, bank total off).
+
+*C5 holds with =NODE_ID= set, the WAL kept, a working WAL disk, no
+=PREPARE= in flight at the crash, and every shard reachable during
+recovery.* =kill-pgdog= with the WAL kept, on
+LazyFS (losing unfsynced writes) at fsync interval 0 and 100 ms, with one
+PgDog or two, and =pause-pgdog=, =partition-clients=: 0 orphans, 0 partial,
+recovery committed the phase-2 txns. Outside those conditions: F9–F12,
+F17.
+
+*C12 does not hold* for errors PgDog generates itself (F8); it holds for
+errors from Postgres (row 10).
+
+Not clean: F8–F17 and N3–N6 in [[*Findings][Findings]].
+
+Expected anomalies (not bugs; PgDog promises no global snapshot): whole
+histories are checked at read-committed, each shard's projection at the
+requested level. The strong cross-shard model (strict-serializable /
+strong-SI over the whole history) is recorded as =:realtime= for
+information; it fails as expected (read skew across shards). Bank reads
+during the run see a wrong total (counted, not failed).
+
+Harness:
+- [X] =--cross-shard=: Elle list-append over keys spread round-robin over
+      the shards (=shard/global-key=); txns of at least 2 micro-ops, most
+      touching 2–3 shards. Each op carries =:shards=, so attribution and
+      per-shard projection know its participants.
+- [X] =atomicity= checker (=two_pc.clj=): after recovery, every
+      cross-shard txn's appends are looked up in the final direct read of
+      each shard: present on all / none / some. =:partial= is always a bug;
+      =:ok= must be present, =:fail= absent.
+- [X] =orphans= checker: after healing, wait up to =--two-pc-deadline=
+      (60 s) for =pg_prepared_xacts= to empty, then list any =__pgdog_2pc_=
+      gid left on any shard.
+- [X] =bank= workload (=workload/bank.clj=): transfers with a balance
+      check, 80% across shards (=--cross-frac=); =--auto-frac= turns some
+      into one autocommit =UPDATE= over both accounts (F15). Final total,
+      no negatives, final read through PgDog equal to the direct read.
+- [X] C12 error injection (=--inject-errors F --inject-error-kind
+      server|syntax|mixed=): the txn hits an error on one shard, then sends
+      =COMMIT= anyway; the op is =:fail=.
+- [X] =--wal-mode keep|wipe|lazyfs=, =--wal-fsync-interval=, =--no-node-id=,
+      =--two-pc-auto=, =--lock-timeout= (Postgres, see N5),
+      =--drain-timeout=.
+- [X] =lein run recheck-workload DIR...= re-runs the whole workload checker
+      on stored histories.
+- [X] =repro/two_pc.sh=: deterministic phase-window scenarios (see "M3
+      setup" in Findings).
+
+Notes:
+- The C12 injection first lost every acked append: my client stopped
+  sending =COMMIT= on the normal path. Caught by =lost= and the empty shard
+  dump; fixed before the matrix.
+- Rows 19 (=--wal-mode wipe=) and 25 (bank, =--no-node-id=) were valid: no
+  kill landed in a 2PC window. The follow-up re-ran them with =--nemesis-interval 3=; see
+  Results. The deterministic repros cover both windows.
+- Rows 27 and 30 failed only the 15 s =pools= check (N6); the follow-up
+  with =--drain-timeout 300= drained.
+- Cross-shard deadlocks (N5) need =lock_timeout= on the shards, or runs
+  stall.
 
 ** TODO M4: Query rewrites (C6, C7, H6)
 - =multi-insert= and =shard-move= with 2PC off/on, under kill and partition
@@ -1224,6 +1342,571 @@ Suggest: route catalog reads inside a txn to a shard the txn already holds;
 document it. Investigated with run
 =pgdog-sharded-append-serializable-c20-t120-terminate-backend/2026-11-20T09:08:59=.
 
+** M3 setup (applies to F8–F17, N3–N6)
+Found in M3 with PgDog sources at =61e9a90bec54= (v0.1.65, unchanged on branch
+=jepsen= through =a24b29e=), Postgres 17, three shards (n3/n4/n5),
+=two_phase_commit = true= unless noted, =NODE_ID= set (=pgdog-1=, =pgdog-2=)
+unless noted, WAL on local disk with =two_phase_commit_wal_fsync_interval = 0=.
+Jepsen runs: two PgDogs, =default_pool_size = 20=, Postgres =lock_timeout = 3s=,
+SERIALIZABLE unless noted; the M3 matrix is =store/matrix-20261120T122054.tsv=
+("row N" below; row N is line N+1). Deterministic repros:
+=integration/jepsen/repro/two_pc.sh= (one PgDog, pool 4, psql over the simple
+protocol); their output is archived in =store/repro-2pc-20261120T142512/=.
+They hold a 2PC phase open with a deferred constraint trigger that waits on
+an advisory lock inside =PREPARE TRANSACTION= (phase 1), or with an iptables
+rule that drops one server connection's packets after its =PREPARE= went
+through (phase 2). Every finding below was re-checked against the source and
+the archived evidence by independent reviewers (adversarial pass); their
+corrections are folded in. Cites without a directory are under
+=pgdog/src/frontend/client/query_engine/=.
+
+The docs (https://docs.pgdog.dev/features/sharding/2pc/) say cross-shard
+txns with 2PC "have a very high chance of being atomic", that "If an error
+happens before or during phase 1, the transaction will be rolled back
+automatically", that "If an error happens during phase 2, the transaction is
+automatically committed", and (crash-recovery page) that recovery needs "a
+durable storage medium".
+
+** F8: An error PgDog generates itself does not abort the txn; the client's =COMMIT= then commits it (C12)
+1. *Claim:* C12 ("If we experienced an error and client tries to commit
+   transaction anyway, we rollback to prevent cross-shard inconsistencies",
+   =end_transaction.rs:53-55=) and C1 (Postgres semantics: after an error
+   the txn is aborted, every statement fails with 25P02, =COMMIT= answers
+   =ROLLBACK=). With or without 2PC, whenever PgDog's query parser is in use
+   (always when sharded; for unsharded clusters only with replicas,
+   =query_parser = "on"= etc., =backend/pool/cluster.rs:625-645=).
+2. *Severity:* atomicity / isolation violation: writes of a txn the client
+   saw fail become visible (Elle G1a, aborted read). Statements sent after
+   the error also run and commit.
+3. *Reproducer:* =bash repro/two_pc.sh c12-syntax= (and =--2pc off=): =BEGIN=;
+   insert on shard 0; insert on shard 1; =SELEC 1=; =UPDATE= on shard 0;
+   =COMMIT=. Jepsen: =-w append --mode sharded --cross-shard --two-pc
+   --inject-errors 0.2 --inject-error-kind syntax= (20% of cross-shard txns
+   send a syntax error in the middle, then =COMMIT= anyway, as a client that
+   ignores errors, or an ORM that catches and continues, would).
+4. *Evidence:*
+   - Repro (=c12-syntax.log=, =c12-syntax-2pc-off.log=): through PgDog
+     =SELEC 1= fails with =ERROR: parser: Error parsing query: Invalid
+     statement: syntax error at or near "SELEC"=, the =UPDATE= after it
+     answers =UPDATE 1=, =COMMIT= answers =COMMIT=, and both rows are on the
+     shards (2PC on and off). Straight to Postgres the =UPDATE= fails with
+     =current transaction is aborted= and =COMMIT= answers =ROLLBACK=.
+   - Jepsen row 11 (2PC on): every injected txn with writes whose =COMMIT=
+     returned success committed: 1286 txns failed on the client yet are
+     visible; Elle =:G1a :dirty-update=
+     (=pgdog-sharded-append-serializable-xshard-2pc-inject0.2-syntax-lt3000-pool20-c20-t120/2026-11-20T12:47:56=).
+     Row 12 (2PC off): 1167 injected txns visible (1157 whole, 10 partial);
+     the matrix's fail-vis 1186 also counts 19 ordinary commit-time partials
+     of 2PC-off. Row 10, the same injection with errors raised by Postgres
+     (=SELECT 1/0=, 22012): valid, all 1190 injected txns with writes absent.
+     Row 13 (bank, mixed errors) passes only because a transfer's two
+     =UPDATE=s run before the injected error and the bank checker sees only
+     totals.
+5. *Root cause:* =end_transaction.rs:56= rolls back only when
+   =context.in_error()=, which is set from the server's =ReadyForQuery=
+   status (=query.rs:340-343=) or by error paths that call
+   =transaction.set_error()= (some do: =route_query.rs:173-175, 203-205,
+   226-228=, =set.rs:46=). Many errors PgDog answers itself don't: parse
+   errors (=mod.rs:177-185=, =ErrorResponse::syntax=); in =route_query.rs=
+   the =OmniWriteWithDirective= (192), =UnmappedShardKey= (211),
+   =DirectShardMismatch= (234) and catch-all (244) arms and the sharding-key
+   lookup failures (136-143, 148-152); =query.rs:568-575=
+   (=cross_shard_disabled=); =set.rs:193-198=; =mod.rs:164-168= (missing
+   prepared statement); =multi_step/update.rs:149-156=. The client is sent
+   ='E'= in =ReadyForQuery= (=net/stream.rs:367-382=), so it believes the txn
+   failed, but PgDog's state and the servers' txns are still open; later
+   statements run (=transaction_error_check=, =query.rs:613-633=, sees no
+   error), and =COMMIT= goes through =end_two_pc= or a plain =COMMIT=. PgDog's
+   own tests expect Postgres semantics here (=test/lazy_connections.rs=,
+   =test/unsupported_aggregation.rs:87= expect 25P02).
+6. *Suggested fix:* mark the txn failed in one place: =send_error_response=
+   (=query.rs:653-669=) or =error_response= should call =set_error()=
+   whenever the client is in a txn. Then the existing =in_error= paths answer
+   later statements with 25P02 and =COMMIT= with =ROLLBACK=. Two details:
+   - =BEGIN; SELEC 1; COMMIT= with no server connected yet goes to
+     =end_not_connected(.., rollback = false)= (=end_transaction.rs:9-41=),
+     which answers =COMMIT=; it must answer =ROLLBACK= when =in_error()=.
+   - =set_error()= turns =TransactionType::Implicit= (split extended
+     requests, =client/mod.rs:663-669=) into an error type; check that such
+     an implicit txn is still cleared at =Sync=.
+   *Regression test:* in =query_engine/test/=: =BEGIN=, an insert,
+   =SELEC 1=, an insert, =COMMIT=; expect 25P02 for the second insert,
+   =ROLLBACK= as the =COMMIT= tag, and no row on the server; plus
+   =BEGIN; SELEC 1; COMMIT=; one variant per error arm above.
+
+** F9: Without a stable =NODE_ID=, crash recovery resolves the wrong gids: in-doubt txns stay prepared forever, and a txn killed in phase 2 stays half-committed (H1)
+1. *Claims:* C4, C5 ("phase-2 txns are committed" after a crash).
+   =NODE_ID= is documented only for unique IDs (D4).
+2. *Severity:* atomicity violation (a cross-shard txn committed on some
+   shards, never on the others) and stuck locks: the orphaned prepared txns
+   keep their row locks and SIREAD locks until someone runs
+   =ROLLBACK/COMMIT PREPARED= by hand. Writers to those rows block (or hit
+   =lock_timeout=), and the orphans hold back =xmin= (vacuum) and block DDL
+   on their tables. No acked write is lost: PgDog acks only after phase 2.
+3. *Reproducer:* =bash repro/two_pc.sh phase2 --no-node-id= (txn killed
+   after shard 0's =COMMIT PREPARED=) and =phase1 --no-node-id= (killed after
+   shard 0's =PREPARE=). Jepsen: =--nemesis kill-pgdog --no-node-id=.
+4. *Evidence:*
+   - Repro (each scenario starts PgDog with =NODE_ID=pgdog-1= and restarts
+     it without, i.e. a node whose id changes; with =NODE_ID= unset
+     throughout, both ids are random): =phase2-no-node-id.log=: shard 0
+     committed, PgDog killed, recovery logged =committing transaction
+     __pgdog_2pc_7cc8e913_10418798187623323966= while the real gid is
+     =__pgdog_2pc_pgdog-1_10418798187623323966_1=: result PARTIAL (row on
+     shard 0 only), shard 1's gid still prepared. =phase1-no-node-id.log=:
+     recovery rolled back =__pgdog_2pc_13164ede_507771982111035873=, shard 0's
+     =__pgdog_2pc_pgdog-1_507771982111035873_0= stayed prepared. Baselines
+     with =NODE_ID= kept (=phase2-baseline.log=, =phase1-baseline.log=):
+     committed on both shards / absent on both, nothing left prepared.
+   - Jepsen row 18 (=NODE_ID= unset for the whole run): 8 orphaned gids from
+     4 txns on all three shards after a 60 s recovery wait (=:orphans=, e.g.
+     =__pgdog_2pc_24f452f1_17272550450141096832_0= and =_1=). For each of the
+     4 tids the PgDog log has a recovery line under a different random
+     prefix (e.g. =recovery committing transaction
+     __pgdog_2pc_26cd3673_17272550450141096832=), and n5's Postgres log has
+     the matching =prepared transaction with identifier ... does not exist=
+     errors that PgDog swallowed
+     (=...-2pc-no-node-id-lt3000-pool20-c20-t120-kill-pgdog/2026-11-20T13:11:10=).
+     The orphaned txns were prepared on all their shards, so this run shows
+     stuck prepared txns, not a partial commit; the partial commit is shown
+     by the repro. A final SERIALIZABLE read on n5 (two orphans) failed with
+     40001, probably because of them (not proven). Row 17 (=NODE_ID= set,
+     same faults): 0 orphans. Bank without =NODE_ID= (row 25, and a
+     follow-up with =--nemesis-interval 3=): valid, no recovery line in
+     either log, i.e. no kill landed in a 2PC window.
+5. *Root cause:* the gid is =__pgdog_2pc_[<deployment>_]<instance>_<tid>_<shard>=:
+   prefix in =two_pc/transaction.rs:21-31=, formatted by =Display=
+   (=transaction.rs:34-38=) from the /current/ process's =instance_id()=;
+   shard suffix in =two_pc/statement.rs:12-43=. The instance id is
+   =NODE_ID= or 8 random hex chars per process (=util.rs:50-69=);
+   =DEPLOYMENT_ID= (=util.rs:87=) is part of the prefix too. The WAL
+   identity record holds only the =tid= (a =u64=, =transaction.rs:8=) plus
+   user/database (=wal/record/identity.rs:15-41=). After a restart, recovery
+   formats the tid with the new prefix. =cleanup_phase=
+   (=two_pc/manager.rs:336-389=) runs =COMMIT/ROLLBACK PREPARED= with
+   =ignore_missing = true= (=manager.rs:385=);
+   =backend/pool/connection/multi_shard/binding.rs:377= swallows =42704=
+   (no such gid); the monitor then calls =done()= (=manager.rs:301-314,
+   122-129=), which drops the txn and writes a Remove record.
+6. *Suggested fix:* write the full gid prefix (instance and deployment id)
+   into the identity record and use it in recovery; or persist the instance
+   id in a file in the WAL dir and reuse it on restart (format-compatible).
+   Refusing to start with 2PC on and =NODE_ID= unset helps, but does not
+   cover a =NODE_ID= / =DEPLOYMENT_ID= that changes between restarts.
+   Detect the mismatch: =42704= from /every/ shard for a recovered txn (not
+   any single =42704=, which is routine for non-participants) should be
+   logged loudly. *Regression test:* =integration/two_pc/crash_recovery.py=
+   variant without =NODE_ID= (the existing test sets it, line 112).
+
+** F10: A PgDog that comes back without its WAL (or never comes back) leaves its in-doubt txns prepared forever (H2)
+1. *Claims:* C5. The crash-recovery page asks for "a durable disk" and offers
+   the Helm =walPvc= option, which covers a pod restarting on the same PVC.
+   It says nothing about a WAL that is lost anyway (StatefulSet scale-down,
+   a deleted or recreated PVC, a Deployment without =walPvc=, a node that
+   never returns), how to find the stranded txns, or how to resolve them.
+   This is partly inherent to a coordinator-log 2PC design; the gap is
+   detection, tooling and docs.
+2. *Severity:* as F9 (partial commits, stuck locks).
+3. *Reproducer:* =bash repro/two_pc.sh phase2 --wipe=, =phase1 --wipe=.
+   Jepsen: =--nemesis kill-pgdog --wal-mode wipe=.
+4. *Evidence:* repro (=NODE_ID= kept, WAL dir emptied before the restart):
+   =phase2-wipe.log=: PARTIAL (shard 0 committed), shard 1's
+   =__pgdog_2pc_pgdog-1_2653900795219969055_1= still prepared; recovery
+   replays 0 segments and logs no commit or rollback. =phase1-wipe.log=:
+   shard 0's gid orphaned. Jepsen follow-up (=--nemesis-interval 3=, 38
+   kills in 180 s): 11 orphaned gids from 6 txns on all three shards, still
+   prepared after the 60 s recovery wait, e.g.
+   =__pgdog_2pc_pgdog-2_17395769536334390915_0= and =_1=
+   (=pgdog-sharded-append-serializable-xshard-2pc-wal-wipe-lt3000-pool20-c20-t180-kill-pgdog/2026-11-20T14:12:38=);
+   no partial commit in that run (the repro shows it). M3 row 19 (7 kills in
+   ~90 s) was valid: no kill landed in a window.
+5. *Root cause:* each PgDog recovers only from its own WAL
+   (=two_pc/wal/recovery.rs=). The only reader of =pg_prepared_xacts= is
+   =two_pc/server_transactions.rs:9-19=, called only from
+   =backend/replication/logical/publisher/replication_slot.rs:316-322= to log
+   a count.
+6. *Suggested fix:* at least detect and report: at startup and periodically,
+   list =__pgdog_2pc_= gids in =pg_prepared_xacts= older than some bound,
+   log/alert them and expose them in an admin command; document how to
+   resolve them by hand. Automatic resolution needs more than the gids: a
+   gid missing on one participant means either "already committed" (phase 2)
+   or "never prepared" (phase 1), and =pg_prepared_xacts= can't tell them
+   apart (=phase2-wipe= and =phase1-wipe= look the same there), so "roll back
+   unless prepared everywhere" would make a phase-2 partial commit permanent.
+   The commit decision must be durable outside the lost WAL, e.g. a marker
+   row written inside the prepared txn on a designated participant (its
+   commit is the decision) or a coordinator table on a shard, with
+   presumed-abort otherwise. A scan for this instance's own prefix must run
+   before accepting clients, or exclude its own live gids; two PgDogs with
+   the same =NODE_ID= would resolve each other's live txns, so it needs a
+   uniqueness check or lease. *Regression test:* the crash test with the WAL
+   dir deleted before restart.
+
+** F11: WAL write and fsync errors are logged and ignored; the txn proceeds as if its record were durable
+1. *Claims:* C5 and the crash-recovery page's durability requirement: here
+   the disk is present but failing (full, read-only remount, EIO). The code
+   comments say awaiting means durable (=two_pc/wal/writer.rs:45-48=: "wait
+   for it to be flushed to disk. Calls fsync too"; =live_segment.rs:123-125=).
+2. *Severity:* atomicity violation after a crash, with =NODE_ID= set and
+   the WAL dir intact; silent to clients (acked normally; PgDog logs at
+   =ERROR=).
+3. *Reproducer:* =bash repro/two_pc.sh enospc=: the WAL dir is a 512 KiB
+   tmpfs, filled up; 150 cross-shard txns; then the phase-2 kill. Only the
+   write half is reproduced; on tmpfs =sync_data= does not fail, so the
+   fsync half is from reading the code.
+4. *Evidence:* =enospc.log=: with the WAL tmpfs full, all 150 cross-shard
+   txns committed on both shards and were acked normally while PgDog logged
+   219 =[2pc] wal writer error: io: No space left on device (os error 28)=;
+   the WAL segment stayed at 4 KiB. Then a txn was killed in phase 2 (shard
+   0 committed), the disk freed and PgDog restarted with =NODE_ID= and the
+   same WAL dir: recovery replayed 0.004 MB and did nothing; result PARTIAL,
+   =__pgdog_2pc_pgdog-1_11251868335617765931_1= left prepared on shard 1.
+5. *Root cause:* =write_records= (=two_pc/wal/live_segment.rs:211-252=)
+   drains the queue first (212), then writes; on a write, flush or
+   =sync_data= error it returns early (=?= at 222/225/237) and the queued
+   records' =flushed= senders are dropped. The writer loop only logs it
+   (=live_segment.rs:198-200=). =Waiter::wait_flush= ignores the
+   =RecvError= (=live_segment.rs:54-56=), and =WalWriter::add= returns
+   =Ok(())= (=wal/writer.rs:53-63=). So =Manager::transaction_state=
+   (=two_pc/manager.rs:153-188=; =wal.add(..)?= at 168-178 and 180), called
+   by =phase_one= / =phase_two= (=two_pc/mod.rs:57-72=) before =PREPARE= and
+   =COMMIT PREPARED= (=end_transaction.rs:123-134=), never sees an error.
+   The =inspect_err= cleanup at =manager.rs:173-178= is dead code for the
+   same reason. No other check exists (=SegmentRegistry= has no health
+   flag; a failed segment swap is also only logged, =writer.rs:168-173=).
+6. *Suggested fix:* send =Result= over the flush channel and fail =add=:
+   - A failed identity record must abort the txn before =PREPARE= (client
+     gets an error, nothing prepared).
+   - A failed phase record must not let =COMMIT PREPARED= start. Note that
+     =set_transaction_state= (=manager.rs:164=) moves the in-memory phase to
+     Phase2 /before/ the WAL write, and a dropped guard then queues the txn
+     for cleanup, which commits Phase2 txns (=manager.rs:258-269, 348-352=);
+     set the phase only after the record is durable, or revert it.
+   - A failed Remove record (=Manager::done=, =manager.rs:126=) must only be
+     logged: the monitor calls =done(..).await.unwrap()= (=manager.rs:313=)
+     and =end_transaction.rs:139= would report an error for a committed txn.
+   - After a write error the segment may end in a torn record that
+     =Segment::load= (=wal/segment.rs:67-104=) would misparse; truncate to
+     the last good offset or rotate to a new segment.
+   - Don't retry =fsync= on the same file after a failure (Linux may drop
+     the dirty pages and report success next time); do what Postgres does
+     (=data_sync_retry = off=: crash) or rewrite the record into a new
+     segment and fsync that.
+   *Regression test:* a WAL unit test with a writer that fails =write_all=
+   / =sync_data=; =add= must return an error and no =PREPARE= is sent.
+
+** F12: A =PREPARE= still running when PgDog dies can land after recovery; the txn is left prepared, even with =NODE_ID= and the WAL intact
+1. *Claims:* C5 (phase-1 txns are rolled back automatically).
+2. *Severity:* stuck locks (one orphan per such txn); no partial commit
+   (the txn was in phase 1 and the other shards rolled back).
+3. *Reproducer:* =bash repro/two_pc.sh late-prepare=: shard 1's =PREPARE=
+   is stalled (deferred trigger waiting on a lock), PgDog is killed and
+   restarted, recovery rolls back shard 0 and runs =ROLLBACK PREPARED= on
+   shard 1 too (=42704=, ignored); then the stall ends and shard 1's
+   =PREPARE= completes. In production the window is a =PREPARE= that is slow
+   for any reason: deferred constraint triggers, lock waits (with the
+   default =client_connection_check_interval = 0=, Postgres does not notice
+   the dead client until the statement ends), or a slow WAL flush on the
+   shard. The last one can't be interrupted at all: the prepared txn exists
+   but is not yet valid, so =ROLLBACK PREPARED= still gets =42704=.
+4. *Evidence:* =late-prepare.log=: shard 1's =PREPARE= stalled
+   (=__pgdog_2pc_pgdog-1_7284877293558307058_1=), shard 0 prepared; PgDog
+   killed and restarted with =NODE_ID= and its WAL; recovery logged
+   =rolling back transaction __pgdog_2pc_pgdog-1_7284877293558307058= and
+   shard 0 emptied; then the gate opened (the script checked the =PREPARE=
+   was still running). Result: absent on both shards, but
+   =__pgdog_2pc_pgdog-1_7284877293558307058_1= stayed prepared on shard 1,
+   and an =INSERT= of the same key through PgDog failed with
+   =canceling statement due to lock timeout= (the script's =lock_timeout=
+   of 2 s; the log's final =exit=1= is that psql).
+5. *Root cause:* recovery maps Phase1 to rollback (=two_pc/manager.rs:348-353=),
+   sends it with =ignore_missing= (=manager.rs:385=), treats =42704= as done
+   (=backend/pool/connection/multi_shard/binding.rs:356-391=, check at 377)
+   and then forgets the txn (=manager.rs:312-313=, =done()=).
+6. *Suggested fix:* before resolving a phase-1 txn, check =pg_stat_activity=
+   on each shard for a running =PREPARE TRANSACTION '<gid>'= (the gid is
+   deterministic and sent as a simple query, so it appears verbatim); cancel
+   or terminate it, wait for the backend to exit, then re-check
+   =pg_prepared_xacts= and retry =ROLLBACK PREPARED=. (PgDog's server
+   connections carry no per-instance =application_name=, so matching by
+   connection doesn't work.) Re-queueing =42704= results with backoff only
+   narrows the window. A periodic =pg_prepared_xacts= sweep (F10) also
+   catches it. Operators can set =client_connection_check_interval= (PG14+)
+   to abort stalled statements of dead clients sooner. *Regression test:* the
+   late-prepare sequence above.
+
+** F13: An error on =COMMIT= of a 2PC txn does not tell the client whether it committed: a phase-2 connection loss is reported as =FATAL 58000=, the same as a phase-1 one, and then committed (H4)
+1. *Claims:* transparency, H4; the 2PC form of F5. The docs say phase-1
+   errors roll back and phase-2 errors commit, but the client cannot tell
+   which phase failed. When the server connection drops without a server
+   error (crash restart, immediate stop, TCP reset), both phases produce
+   =FATAL 58000= (from =ErrorResponse::from_client_err=,
+   =net/messages/error_response.rs:316=, see F5). When Postgres sends its own
+   error (e.g. =57P01=), it is passed through, and clients already treat
+   those as indeterminate.
+2. *Severity:* client-visible atomicity: a txn reported as failed is
+   committed. Clients that retry apply it twice.
+3. *Reproducer:* =bash repro/two_pc.sh h4= (shard 1 resets PgDog's
+   connection after shard 0's =COMMIT PREPARED=). Jepsen:
+   =-w append --mode sharded --cross-shard --two-pc --concurrency 20
+   --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 180
+   --nemesis terminate-backend,kill-backend,restart-postgres
+   --nemesis-interval 4 --strict-commit-errors=.
+4. *Evidence:*
+   - Repro: =h4.log=: shard 0 ran =COMMIT PREPARED=, shard 1 reset the
+     connection; psql got =FATAL: net: io: Connection reset by peer (os
+     error 104)= for =COMMIT=; in the same millisecond PgDog logged =[2pc]
+     manager committing transaction __pgdog_2pc_pgdog-1_7457636067096773719=,
+     and the txn ended up committed on both shards.
+   - Jepsen row 32: 2 txns failed with =FATAL: net: io: Connection reset by
+     peer (os error 104)= (58000) on =COMMIT= and turned out committed; Elle
+     =:G1a :dirty-update=
+     (=...-2pc-lt3000-pool20-strict-c20-t180-terminate-backend+kill-backend+restart-postgres/2026-11-20T13:50:13=).
+     (a) op 11631 (process 14), failed at 21:50:50.847Z; n1 logged =manager
+     committing transaction __pgdog_2pc_pgdog-1_8398892028686749072= at
+     50.841Z; cause: a =kill-backend= on n3 (invoked 21:50:50.708Z) and the
+     postmaster crash-restart that followed. (b) op 20695 (process 9), failed
+     at 21:51:06.211Z; n1 logged =manager committing= at 06.205Z (its first
+     =COMMIT PREPARED= attempt failed and was retried); cause: a
+     =restart-postgres= (immediate stop) on n3 invoked at 21:51:06.148Z.
+   - The same SQLSTATE covered both outcomes: of 19 =COMMIT=s that failed
+     with 58000 in that run, 2 committed; e.g. at 21:50:22.992Z a =COMMIT= on
+     n1 failed with the same =Connection reset by peer= and n1 logged
+     =manager rolling back transaction __pgdog_2pc_pgdog-1_1577975806608829863=.
+   - Row 31, same faults with failed =COMMIT=s classified as =:info=: valid.
+5. *Root cause:* =end_two_pc= (=end_transaction.rs:109-143=) returns the
+   phase-2 error with =?= (131-134); the client loop turns it into
+   =FATAL 58000= (=frontend/client/mod.rs:537=, F5) and disconnects; the
+   dropped guards (=two_pc/guard.rs:9-13= → =manager.rs:258-270=) queue the
+   txn and, since its in-memory phase is Phase2, the manager commits it
+   (=manager.rs:348-352=).
+6. *Suggested fix:* after phase 1 has succeeded, the outcome is decided. Either:
+   - return success once the phase-2 record is durable and let the manager
+     finish =COMMIT PREPARED= (what the docs promise). Caveats: the same
+     session's next txn may not see its own write on a shard where
+     =COMMIT PREPARED= is still pending (or block on its locks); and the
+     record is only durable with a WAL configured (D6) and F11 fixed; or
+   - report an "outcome unknown" code (e.g. =08006=) for phase-2 failures
+     and document it.
+   Phase-1 failures should keep returning the server's error (definite
+   rollback). *Regression test:* make one shard's =COMMIT PREPARED= fail with
+   a dropped connection while the others succeed (they run concurrently,
+   =multi_shard/binding.rs:357-388=), and assert on the client's SQLSTATE.
+
+** F14: =COMMIT AND CHAIN= of a multi-shard txn under 2PC drops the chain: the next txn's writes autocommit, and its =ROLLBACK= rolls nothing back
+1. *Claim:* C1 (Postgres semantics of =COMMIT AND CHAIN=).
+2. *Severity:* atomicity: statements the client believes are in a txn are
+   committed one by one.
+3. *Reproducer:* =bash repro/two_pc.sh chain= (=--2pc off= for the
+   baseline): =BEGIN=; insert on shards 0 and 1; =COMMIT AND CHAIN=; insert
+   on shards 0 and 1; =ROLLBACK=.
+4. *Evidence:* =chain.log=: psql shows =COMMIT=, two =INSERT 0 1=,
+   =ROLLBACK= with =WARNING: there is no transaction in progress= (PgDog's,
+   not Postgres'); both chained rows are on the shards. =chain-2pc-off.log=:
+   same statements, no warning, 0 chained rows (Postgres semantics).
+5. *Root cause:* =router/parser/query/transaction.rs:31-36= maps every
+   =TRANS_STMT_COMMIT= to =Command::CommitTransaction=, dropping the =chain=
+   flag (the parser test =test_session_control.rs:156-191= asserts exactly
+   that). With 2PC (=end_transaction.rs:76-85=: write txn on more than one
+   shard), =end_two_pc= sends =PREPARE= / =COMMIT PREPARED= and never the
+   client's text (119-140), then =end_not_connected= fakes a plain =COMMIT=
+   and clears =context.transaction= (=end_transaction.rs:17-26=), so the
+   next statements autocommit and the =ROLLBACK= is answered by PgDog.
+   Without 2PC (one shard, or 2PC off) the client's text is forwarded
+   (98-104) and the connected servers chain. By code reading only (not
+   reproduced): =COMMIT AND CHAIN= after an error in the txn also loses the
+   chain even with 2PC off, because PgDog sends a literal =ROLLBACK=
+   (56-73), while Postgres rolls back and starts the chained txn.
+6. *Suggested fix:* honour =chain=: after the commit (2PC or not) keep the
+   client in a txn (=context.transaction= set, =ReadyForQuery= 'T', a new 2PC
+   txn id) with the same characteristics, including ones set later with
+   =SET TRANSACTION= (replaying the stored =BEGIN= alone doesn't carry
+   those). Or reject =AND CHAIN= with =0A000= at parse time, before any
+   =PREPARE=, leaving the txn open. *Regression test:* the sequence above
+   with 2PC on; expect 0 rows from the chained txn.
+
+** F15: Cross-shard autocommit writes are not atomic unless =two_phase_commit_auto= is on, and one docs page says it is on by default (D1)
+1. *Claim:* C4 as the general settings page states it (=two_phase_commit_auto=
+   "Default: true"). The 2PC page says it is "disabled by default", explains
+   the cost, and says you don't need it if writes are idempotent; the code
+   agrees (=backend/pool/cluster.rs:270-273=, =pgdog-config/src/general.rs:668-670=).
+   So the default is intended; the bug is the general settings page.
+2. *Severity:* atomicity violation for users who trust that page: a
+   multi-shard =UPDATE= / =DELETE= / =INSERT= outside =BEGIN= commits on the
+   shards where it succeeded and returns the error from the one where it
+   failed.
+3. *Reproducer:* =bash repro/two_pc.sh autocommit= (and =--auto on=): one
+   =UPDATE ... WHERE k IN (a, b)= moving 10 from an account holding 5 (shard
+   0, =CHECK (bal >= 0)=) to one on shard 1. Jepsen: =-w bank --two-pc
+   --auto-frac 0.5= (half the cross-shard transfers are such a statement).
+4. *Evidence:* repro: =autocommit.log=: the statement fails with
+   =new row for relation "acct" violates check constraint "acct_bal_check"=,
+   yet the balances go from 5 + 5 to 5 + 15 (the credit committed on shard
+   1); =autocommit-auto-on.log=: same error, balances stay 5 + 5. Jepsen row
+   14 (auto off): final total 2614 instead of 800. The 490 =:fail= transfers
+   (all the =CHECK= violation) kept credits summing to 1805; the other 9 came
+   from some of the 12 =:info= ones (lock timeouts), which also committed on
+   one shard only. Rows 15 and 16 (auto on; 16 with
+   kill/pause-postgres): total conserved, but no transfer hit the =CHECK=
+   there (balances stayed ≥ 60), so they only show conservation when one
+   shard's part fails by lock timeout or a fault; the =CHECK= case with auto
+   on rests on =autocommit-auto-on.log=.
+5. *Root cause:* by design when auto is off; the issue is the conflicting
+   docs.
+6. *Suggested fix:* fix the general settings page; consider a startup
+   warning when =two_phase_commit= is on and auto is off. (See N5 for the
+   throughput cost of auto in a hot-spot workload.)
+
+** F16: A JDBC batch (one pipeline, one =Sync=) across shards is not atomic, even with =two_phase_commit_auto=
+1. *Claim:* C1 / C4. Postgres runs the extended-protocol messages up to a
+   =Sync= as one implicit txn when no =BEGIN= was sent, so a batch that
+   pgjdbc sends with one =Sync= (as here; pgjdbc inserts extra =Sync=s in
+   very large batches) is all or nothing against Postgres.
+2. *Severity:* atomicity violation, silent (the client gets the batch error
+   and assumes nothing was written).
+3. *Reproducer:* =bash repro/two_pc.sh batch= (and =--auto on=), which runs
+   =repro/batch.clj=: autocommit on, one =PreparedStatement= batch of three
+   =INSERT=s: a new key on shard 0, a new key on shard 1, and a key that
+   already exists on shard 1.
+4. *Evidence:* =batch.log=, =batch-auto-on.log=: =executeBatch= fails with
+   =23505= on entry 2; afterwards shard 0's row is there and shard 1's new
+   row is not (it shared shard 1's implicit txn with the duplicate). Postgres
+   semantics: neither. The same batch straight to one Postgres leaves 0 rows.
+5. *Root cause:* PgDog splits the pipeline at each =Execute=
+   (=split.rs:48-58=, =frontend/client_request.rs:351-410=). The first
+   =INSERT= opens an implicit txn on shard 0; the shard-1 =INSERT= upgrades
+   the binding to multi-shard and keeps shard 0's connection
+   (=backend/pool/connection/multi_shard/upgrade.rs:62-74=; the comment at 65
+   notes "the server can be in a partially comitted state, e.g., implicit
+   transaction"); the =Sync= goes to every connected shard (=query.rs:63-64=,
+   =multi_shard/binding.rs:236-283=), and each Postgres ends its own implicit
+   txn: shard 0 commits, shard 1 rolls back. Auto 2PC never starts because
+   =two_pc_check= (=query.rs:587-611=) needs a single statement that is
+   itself cross-shard (=route().should_2pc()=,
+   =frontend/router/parser/route.rs:408-410=).
+6. *Suggested fix:* when a pipeline without =BEGIN= upgrades from one shard
+   to several before its =Sync=, turn it into an explicit txn: inject
+   =BEGIN= on the already-connected shard(s) (that keeps the earlier
+   statements in it) and on the new one, then finish at the =Sync= with 2PC
+   (or =ROLLBACK= on any error). Refusing such pipelines is simpler but
+   breaks ordinary multi-shard pipelines. At least document that batches
+   across shards are atomic per shard only. *Regression test:* a raw
+   Parse/Bind/Execute×3/Sync across two shards with a failing last
+   statement, expecting no rows (=test/regression_auto_two_pc.rs= covers
+   only one multi-row =INSERT=).
+
+** F17: Resolving an in-doubt 2PC txn needs every shard up: one shard's outage keeps other shards' prepared txns, and the whole cleanup queue, stuck
+1. *Claims:* C5, availability.
+2. *Severity:* stuck locks on healthy shards for the length of an unrelated
+   shard's outage. Applies to post-crash recovery and to runtime cleanup
+   (every phase-1 failure or interrupted phase 2 goes through the same
+   path). The monitor resolves one txn at a time, each failed attempt costs
+   a full =checkout_timeout=, and failures re-queue at the back, so one hung
+   shard delays every queued txn.
+3. *Reproducer:* =bash repro/two_pc.sh stuck-shard=: a txn on shards 0 and
+   1 is killed in phase 1 (shard 0 prepared), shard 2 (not in the txn) is
+   paused with =SIGSTOP=, PgDog restarts.
+4. *Evidence:* =stuck-shard.log=: 15 s after the restart shard 0's
+   =__pgdog_2pc_pgdog-1_9676185952246112898_0= was still prepared; the log
+   shows =error cleaning up ... transaction: checkout timeout= followed by
+   =recovery rolling back transaction ...=, ~5 s apart (the default
+   =checkout_timeout=), the first ~10 s after the restart; 10 s after shard 2
+   resumed it was gone.
+5. *Root cause:* =cleanup_phase= connects with =Shard::All=
+   (=two_pc/manager.rs:379-384=) whatever shards the txn touched, so one
+   unreachable shard fails the whole cleanup; on error the txn is pushed
+   back on the queue and retried (=manager.rs:301-317=).
+6. *Suggested fix:* resolve each shard independently (the per-shard gid
+   already carries the shard number, and the decision, rollback for phase 1
+   or commit for phase 2, is already durable), only on the shards the txn
+   used (record them in the identity record), with per-shard backoff; and
+   don't let one txn's cleanup block the queue (resolve concurrently).
+   *Regression test:* the sequence above: shard 0 must be resolved while
+   shard 2 is down.
+
+** N3: Read-only multi-shard txns go through 2PC
+Design note / doc discrepancy D9. The 2PC gate (=end_transaction.rs:75-80=,
+commented "2pc is used for cross-shard writes") checks =transaction.write()=,
+which is just "not started =READ ONLY=" (=transaction_type.rs:118-120=; the
+type comes only from the =BEGIN= options,
+=router/parser/query/transaction.rs:42-84=). So a =BEGIN= block that only
+reads two shards is finished with =PREPARE TRANSACTION= / =COMMIT PREPARED=
+(=readonly-2pc.log=: =BEGIN=, one =SELECT= per shard, =COMMIT= reached both
+shards as =PREPARE TRANSACTION '__pgdog_2pc_pgdog-1_14455736225506589247_0'=
+/ =_1= and =COMMIT PREPARED=). Costs: one extra round trip and two PgDog WAL
+fsyncs per read txn; on each shard an xid and two WAL flushes where a plain
+read-only =COMMIT= has neither, and a =max_prepared_transactions= slot
+while in flight. These txns are also exposed to F9–F12: an orphaned
+read-only txn holds SIREAD locks, =xmin= and its =AccessShareLock=s (which
+block DDL / =TRUNCATE= / =VACUUM FULL=). The docs may mean =BEGIN READ
+ONLY= (which does skip 2PC); say so. A fix can't rely on the router's
+read/write classification alone (=SELECT f()= or =nextval()= write): check
+on the server (e.g. =pg_current_xact_id_if_assigned()= per shard) or
+prepare only the shards that have an xid.
+
+** N4: A failed 2PC commit always disconnects the client, including routine phase-1 serialization failures
+Design note. Any error out of =end_two_pc= (=end_transaction.rs:109-140=,
+called with =?= at 85 and =query.rs:345, 359=) propagates through
+=Client::client_messages= (=frontend/client/mod.rs:603=) to
+=spawn_internal=, which sends the error and closes the socket. For a server
+error the client gets the server's own =ERROR= (e.g. =40001= from =PREPARE=)
+followed by EOF, not a =FATAL=; drivers then report a broken connection on
+next use (pgjdbc 08006) rather than a retryable error on a usable session.
+=deferred-fail.log=: a deferred constraint fails at =PREPARE= on shard 1;
+psql gets the server's =ERROR=, then "server closed the connection
+unexpectedly"; the txn is correctly absent on both shards (with =--2pc off=
+it is PARTIAL). Under SERIALIZABLE, 40001 at =PREPARE= disconnected clients
+138–647 times per 120 s run (0 at RR and RC). The docs say the client
+"receives an error"; the disconnect is undocumented, and Postgres keeps the
+session after a failed =COMMIT=. Suggest: on a phase-1 failure, run the
+cleanup, send the error and =ReadyForQuery 'I'=, and keep the client.
+
+** N5: No distributed deadlock detection; with Postgres' default =lock_timeout = 0= a cross-shard deadlock hangs forever, and killing the clients doesn't end it
+Design note. Two txns that lock rows on two shards in opposite orders wait
+for each other across shards; each Postgres sees only half of the cycle.
+=xdeadlock.log=: A updates a row on shard 0, then one on shard 1; B the
+reverse; =lock_timeout = 0=. Both first =UPDATE=s succeed; at 25 s each shard
+has one session waiting on a lock; neither Postgres reports a deadlock; both
+sessions are still blocked when the psql clients are killed at 45 s, and
+afterwards direct =UPDATE=s of those rows on the shards still time out on
+the locks: PgDog does not read the client socket while a statement is in
+flight (=frontend/client/mod.rs:597-604=), so the server sessions stay
+blocked. In a first run without a client timeout the script was killed by
+an outer 10-minute timeout (=xdeadlock-first-run-hung.log=, exit 124). Only
+a server-side =lock_timeout= / =statement_timeout= or PgDog's
+=query_timeout= (default unlimited, =pgdog-config/src/general.rs:1234-1238=)
+breaks it. The M3 Jepsen runs set =lock_timeout = 3s= on the shards for this
+reason. With =two_phase_commit_auto= every cross-shard autocommit statement
+holds its locks on all shards until all have prepared. In the hot-spot bank
+workload (8 accounts, 20 clients) row 15 (auto on) had 336 lock timeouts
+against 73 in row 14 (auto off), and 995 ok ops in 120 s against 27,865
+(only 29 =BEGIN= transfers and 499 autocommit transfers succeeded);
+consistent with frequent cross-shard lock cycles, not proof of them, and
+specific to this workload. Citus detects distributed deadlocks. Suggest:
+document the need for =lock_timeout= / =statement_timeout= with sharding,
+and have a cross-shard wait timeout cancel the server statements.
+
+** N6: Half-open connections can hold server connections (and locks) for a long time after a partition
+Observation, not a finding.
+- Row 27 (=partition-clients=): n2 had 5 server connections checked out (3
+  =idle in transaction=) 74 s after the clients' last statements when the
+  15 s pool check began, still held when it gave up ~89 s after. 4 client
+  connections from just before a partition were never logged as
+  disconnected. Hypothesis (unverified): their client sockets were closed
+  during the partition and PgDog never saw the FIN.
+  =client_idle_in_transaction_timeout= (default unlimited,
+  =pgdog-config/src/general.rs:1227-1232=) would end these; TCP keepalive
+  uses the OS default (2 h idle).
+- Row 30 (=partition= PgDog ↔ shards): server connections were still checked
+  out mid-query 29 s (n1) and 44 s (n2) after the last heal. That case needs
+  =query_timeout= (default unlimited) or a TCP =user_timeout= (default
+  none).
+- Both rows failed only the =pools= check; follow-up runs with a 300 s drain
+  wait drained on the first poll, but had no stuck connection to begin
+  with, so the hold time is not measured.
+Suggest finite defaults for these timeouts, or a note in the sharding and
+2PC docs.
+
 * Results
 | Claim | Config | Nemesis | Outcome | Run (store path) | Finding # |
 |-------+--------+---------+---------+------------------+-----------|
@@ -1264,6 +1947,29 @@ document it. Investigated with run
 | C3 | follow-ups with no driver catalog queries | none; terminate/kill-backend; pause-pool | holds; 0.98 xacts/txn; a shard fault reaches no txn on another shard | =matrix-20261120T102007.tsv= rows 1–4 | N2 |
 | — | =RELOAD= / =RECONNECT= under load, sharded | admin | *bug*: shard's pool deadlocked until =RECONNECT=, 2 of 4 runs; deterministic repro | =...-admin/2026-11-20T08:48:07=, =.../10:30:47=; =repro/sharded.sh reload-wedge= | F6 |
 | — | broadcast inside a txn bound to another shard | none | *bug* (liveness): cross-pool deadlock, client killed after =checkout_timeout=; deterministic repro | =repro/sharded.sh checkout-deadlock=; =matrix-20261120T102007.tsv= rows 8–10 | F7 |
+| C4 | x-shard append, 2PC, SER/RR/RC | none | holds (3/3; atomic, 0 orphans) | =matrix-20261120T122054.tsv= rows 1–3 | |
+| C4 | x-shard append, 2PC off, SER (checker validation) | none | fails as expected: 30 partial txns (commit-time 40001 on one shard), G1a | row 4 | |
+| C4 | bank, 2PC on / off | none | holds / fails as expected (total 617 of 800) | rows 5, 6 | |
+| C4 | x-shard append, 2PC: simple, =prepareThreshold=1=, =SET TRANSACTION= | none | holds (3/3) | rows 7–9 | |
+| C12 | x-shard append, 2PC, errors from Postgres (=1/0=) then =COMMIT= | none | holds | row 10 | |
+| C12 | x-shard append, syntax error then =COMMIT=, 2PC on / off | none | *bug*: 1286 / 1186 failed txns committed; G1a | rows 11, 12 | F8 |
+| C12 | bank, mixed errors, 2PC | none | total holds (checker can't see F8 here) | row 13 | F8 |
+| C4 | bank, half the x-shard transfers autocommit, auto off | none | *bug*: total 2614 of 800 | row 14 | F15, D1 |
+| C4 | same, =two_phase_commit_auto= on | none; kill/pause-postgres | holds (2/2); throughput 4% of auto off | rows 15, 16 | N5 |
+| C5 | x-shard append, 2PC, =NODE_ID=, WAL kept / LazyFS fsync 0 / LazyFS fsync 100 ms / 1 PgDog | kill-pgdog | holds (4/4; recovery committed in-doubt txns, 0 orphans) | rows 17, 20, 21, 26 | H3 |
+| C5 | same, =NODE_ID= unset | kill-pgdog | *bug*: 8 orphaned gids (4 txns), 40001 on a final read | row 18 | F9 |
+| C5 | same, WAL wiped on restart; bank =NODE_ID= unset | kill-pgdog | valid (no kill in a 2PC window) | rows 19, 25 | F10, F9 |
+| C5 | follow-up: WAL wiped; bank =NODE_ID= unset; =--nemesis-interval 3= | kill-pgdog | wipe: *bug*, 11 orphaned gids from 6 txns on all three shards; bank without =NODE_ID=: valid (no kill landed in a window) | =matrix-20261120T140709.tsv= rows 3, 4 | F10, F9 |
+| C4 | x-shard append, 2PC off | kill-pgdog | fails as expected (19 partial) | row 22 | |
+| C5 | bank, 2PC | kill-pgdog | holds | row 24 | |
+| C5 | x-shard append, 2PC | pause-pgdog; partition-clients | holds; =pools= check failed at 15 s after partition-clients, drained in the 300 s follow-up | rows 23, 27; follow-up row 1 | N6 |
+| C4 | x-shard append, 2PC | kill-postgres, pause-postgres, partition | holds (3/3; row 30 failed only the 15 s =pools= check, drained in the follow-up) | rows 28–30; follow-up row 2 | |
+| C4 | x-shard append, 2PC, default =COMMIT= classification | terminate/kill-backend, restart-postgres, 4 s | holds | row 31 | |
+| C4/H4 | same, =--strict-commit-errors= | same | *bug*: 2 txns failed on =COMMIT= (58000) and committed; G1a | row 32 | F13 |
+| C4 | x-shard append, 2PC off | kill-postgres | fails as expected (16 partial) | row 33 | |
+| C4 | bank, 2PC | kill-postgres, pause-postgres, partition | holds | row 34 | |
+| C4/C5 | x-shard append, 2PC | every fault, 20 s, 240 s | holds | row 35 | |
+| C4/C5 | deterministic 2PC phase windows | =repro/two_pc.sh= | baselines hold; *bugs* F8–F17; N3–N5 | =store/repro-2pc-20261120T142512/= | F8–F17 |
 
 * Open questions
 - Which edition/version is in scope? Some features (e.g. automatic

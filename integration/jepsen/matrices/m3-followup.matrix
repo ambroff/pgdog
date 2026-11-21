@@ -1,0 +1,8 @@
+# M3 follow-ups. Partition rows with a long drain wait: do the undrained
+# pools of the first M3 run drain once TCP gives up, or are they held until
+# keepalive (7200 s default)? Crash rows with more frequent kills to land a
+# kill in a 2PC window with the WAL wiped / NODE_ID unset.
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis partition-clients --drain-timeout 300
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 120 --nemesis partition --drain-timeout 300
+--mode sharded -w append --cross-shard --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 180 --nemesis kill-pgdog --wal-mode wipe --nemesis-interval 3
+--mode sharded -w bank --two-pc --concurrency 20 --rate 1000 --pool-size 20 --lock-timeout 3000 --time-limit 180 --nemesis kill-pgdog --no-node-id --nemesis-interval 3

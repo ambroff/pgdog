@@ -15,6 +15,7 @@
                     [role :as role]
                     [util :refer [meh]]]
             [jepsen.control.util :as cu]
+            [jepsen.lazyfs :as lazyfs]
             [jepsen.os.debian :as debian]
             [pgdog.jepsen.shard :as shard]))
 
@@ -99,11 +100,32 @@
       ["append"]
       (mapv #(str "append_" %) (range n)))))
 
+(def bank-table
+  "The bank workload's accounts: (k bigint PRIMARY KEY, balance bigint)."
+  "bank")
+
+(defn bank-accounts
+  "The bank workload's account keys: account i is shard/global-key i, so
+  accounts are spread round-robin over the shards."
+  [test]
+  (mapv #(shard/global-key test %) (range (:accounts test 8))))
+
+(defn bank-initial
+  "Each account's starting balance."
+  [test]
+  (quot (:total-amount test 100) (:accounts test 8)))
+
 (def probe-table
   "Sharded mode: one row per shard, at the shard's anchor key (see
   shard/anchor). Probe statements select from it by k, so PgDog routes them
   to the txn's shard like any other keyed statement."
   "jepsen_probe")
+
+(defn dump-tables
+  "Tables the shard dump reads: the bank table for the bank workload, the
+  append tables otherwise."
+  [test]
+  (if (= :bank (:workload test)) [bank-table] (append-tables test)))
 
 (defn shard-index
   "Index of a Postgres node among the shards, in config order."
@@ -121,7 +143,15 @@
     (for [t (append-tables test)]
       (str "CREATE TABLE IF NOT EXISTS " t
            " (k bigint PRIMARY KEY, sk bigint NOT NULL, v text NOT NULL)"))
-    [(str "CREATE TABLE IF NOT EXISTS " probe-table " (k bigint PRIMARY KEY)")]
+    [(str "CREATE TABLE IF NOT EXISTS " probe-table " (k bigint PRIMARY KEY)")
+     (str "CREATE TABLE IF NOT EXISTS " bank-table " (k bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0))")]
+    ;; Bank accounts, each on the shard it maps to (all on the one
+    ;; Postgres in pooler mode).
+    (when (= :bank (:workload test))
+      (for [k (bank-accounts test)
+            :when (or (not= :sharded (:mode test))
+                      (= (shard-index test node) (shard/shard-of test k)))]
+        (str "INSERT INTO " bank-table " VALUES (" k ", " (bank-initial test) ")")))
     (when (= :sharded (:mode test))
       [(str "INSERT INTO " probe-table " VALUES ("
             (shard/anchor test (shard-index test node)) ")")])))
@@ -140,6 +170,10 @@
                "log_line_prefix = '%m [%p] %q%u@%d '"
                ;; Lets a client see which node a statement ran on.
                (str "cluster_name = '" node "'")
+               ;; --lock-timeout: a cross-shard txn can deadlock with another
+               ;; across shards, which no single Postgres can detect. Without
+               ;; a lock timeout both wait until the client's socket timeout.
+               (str "lock_timeout = " (:lock-timeout test 0))
                ""])
     (str (pg-conf-dir test) "/conf.d/jepsen.conf"))
   (let [hba (str (pg-conf-dir test) "/pg_hba.conf")]
@@ -149,8 +183,21 @@
   (c/exec :systemctl :restart (pg-unit test))
   (cu/await-tcp-port pg-port {:timeout 60000}))
 
+(defn rollback-prepared!
+  "Rolls back every prepared txn in the test database. Orphans from an
+  earlier run (M3) hold locks and block DROP DATABASE; the orphan checker
+  has already reported them."
+  []
+  (let [gids (try (psql-rows! "postgres" (str "SELECT gid FROM pg_prepared_xacts WHERE database = '" database "'"))
+                  (catch Exception _ []))]
+    (doseq [[gid] gids]
+      (meh (psql! database (str "ROLLBACK PREPARED '" gid "'"))))
+    (when (seq gids)
+      (info "rolled back" (count gids) "leftover prepared txns"))))
+
 (defn create-database!
   [test node]
+  (rollback-prepared!)
   (psql! (str "DROP DATABASE IF EXISTS " database " WITH (FORCE)"))
   (psql! (str "DROP ROLE IF EXISTS " user))
   (psql! (str "CREATE ROLE " user " LOGIN PASSWORD '" password "'"))
@@ -170,6 +217,7 @@
     (c/su
       (when (cu/exists? (str "/usr/lib/postgresql/" (:pg-version test)))
         (meh (c/exec :systemctl :start (pg-unit test)))
+        (rollback-prepared!)
         (meh (psql! (str "DROP DATABASE IF EXISTS " database " WITH (FORCE)"))))))
 
   db/Kill
@@ -210,6 +258,9 @@
                           (str "pooler_mode = " (toml-str (name (:pooler-mode test))))
                           (str "query_parser = " (toml-str (name (:query-parser test))))
                           (str "two_phase_commit_wal_dir = " (toml-str pgdog-wal))]
+                   (some? (:wal-fsync-interval test))
+                   (conj (str "two_phase_commit_wal_fsync_interval = " (:wal-fsync-interval test)))
+
                    (:two-pc test)
                    (conj "two_phase_commit = true")
 
@@ -237,7 +288,7 @@
         ;; pgdog.jepsen.shard). Mapping entries attach to the
         ;; [[sharded_tables]] entry just above them.
         sharding (when (= :sharded (:mode test))
-                   (for [t (conj (append-tables test) probe-table)]
+                   (for [t (conj (append-tables test) probe-table bank-table)]
                      (concat ["[[sharded_tables]]"
                               (str "database = " (toml-str database))
                               (str "name = " (toml-str t))
@@ -279,6 +330,23 @@
       :--config (str pgdog-dir "/pgdog.toml")
       :--users  (str pgdog-dir "/users.toml"))))
 
+(def wal-lazyfs
+  "--wal-mode lazyfs: the WAL dir is a LazyFS mount, so a kill can also lose
+  every write PgDog did not fsync (as on a power failure)."
+  (lazyfs/lazyfs {:dir pgdog-wal, :lazyfs-dir (str pgdog-wal ".lazyfs")}))
+
+(defn wipe-wal!
+  "--wal-mode wipe: PgDog restarts with an empty WAL dir, as when a pod is
+  rescheduled onto an ephemeral volume (H2)."
+  []
+  (c/su (c/exec :rm :-rf (c/lit (str pgdog-wal "/*")))))
+
+(defn kill-pgdog!
+  [test]
+  (c/su (cu/stop-daemon! "pgdog" pgdog-pid))
+  (when (and (= :lazyfs (:wal-mode test)) (lazyfs/mounted? wal-lazyfs))
+    (lazyfs/lose-unfsynced-writes! wal-lazyfs)))
+
 (defrecord PgDog []
   db/DB
   (setup! [_ test node]
@@ -288,7 +356,12 @@
                  (str "PgDog binary not found at " (.getCanonicalPath bin)
                       "; run cargo build --release")))))
     (c/su
-      (c/exec :mkdir :-p pgdog-dir pgdog-wal)
+      (c/exec :mkdir :-p pgdog-dir)
+      (if (= :lazyfs (:wal-mode test))
+        (do (lazyfs/install!)
+            (when-not (lazyfs/mounted? wal-lazyfs)
+              (lazyfs/mount! wal-lazyfs)))
+        (c/exec :mkdir :-p pgdog-wal))
       (c/upload (:pgdog-bin test) pgdog-bin)
       (c/exec :chmod :+x pgdog-bin)
       (cu/write-file! (pgdog-toml test) (str pgdog-dir "/pgdog.toml"))
@@ -299,12 +372,16 @@
   (teardown! [_ test node]
     (c/su
       (cu/stop-daemon! "pgdog" pgdog-pid)
+      ;; A LazyFS mount from this or an earlier run must go before the rm.
+      (when (lazyfs/mounted? wal-lazyfs)
+        (meh (lazyfs/umount! wal-lazyfs)))
       (c/exec :rm :-rf pgdog-dir)))
 
   db/Kill
   (kill! [_ test node]
-    (c/su (cu/stop-daemon! "pgdog" pgdog-pid)))
+    (kill-pgdog! test))
   (start! [_ test node]
+    (when (= :wipe (:wal-mode test)) (wipe-wal!))
     (start-pgdog! test node))
 
   db/Pause

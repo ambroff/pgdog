@@ -12,15 +12,20 @@
             [jepsen.nemesis :as n]
             [jepsen.nemesis.combined :as nc]
             [jepsen.os.debian :as debian]
+            [jepsen.store :as store]
+            [clojure.pprint]
             [pgdog.jepsen.client :as pc]
             [pgdog.jepsen.db :as db]
             [pgdog.jepsen.nemesis :as pn]
             [pgdog.jepsen.recheck :as recheck]
+            [pgdog.jepsen.two-pc :as two-pc]
             [pgdog.jepsen.workload.append :as append]
+            [pgdog.jepsen.workload.bank :as bank]
             [pgdog.jepsen.workload.session-leak :as session-leak]))
 
 (def workloads
   {:append       append/workload
+   :bank         bank/workload
    :session-leak session-leak/workload})
 
 (def nemesis-faults
@@ -92,7 +97,7 @@
   [opts]
   (str/join "-"
             (cond-> ["pgdog" (name (:mode opts)) (name (:workload opts))]
-              (= :append (:workload opts))
+              (#{:append :bank} (:workload opts))
               (conj (name (:isolation opts)))
 
               (and (= :session-leak (:workload opts))
@@ -101,6 +106,34 @@
 
               (and (= :sharded (:mode opts)) (not= :list (:sharding opts)))
               (conj (name (:sharding opts)))
+
+              (:cross-shard opts)
+              (conj "xshard")
+
+              (:two-pc opts)
+              (conj "2pc")
+
+              (some? (:two-pc-auto opts))
+              (conj (str "auto-" (:two-pc-auto opts)))
+
+              (false? (:node-id opts))
+              (conj "no-node-id")
+
+              (not= :keep (:wal-mode opts))
+              (conj (str "wal-" (name (:wal-mode opts))))
+
+              (some? (:wal-fsync-interval opts))
+              (conj (str "fsync" (:wal-fsync-interval opts)))
+
+              (pos? (:inject-errors opts 0))
+              (conj (str "inject" (:inject-errors opts)
+                         (when (not= :server (:inject-error-kind opts)) (str "-" (name (:inject-error-kind opts))))))
+
+              (pos? (:auto-frac opts 0))
+              (conj (str "autofrac" (:auto-frac opts)))
+
+              (pos? (:lock-timeout opts 0))
+              (conj (str "lt" (:lock-timeout opts)))
 
               (and (= :append (:workload opts))
                    (not= (default-isolation-mode opts) (:isolation-mode opts)))
@@ -172,7 +205,7 @@
         workload ((workloads (:workload opts)) opts)
         pkg      (nemesis-package opts db)
         wrap     (or (:wrap-generator workload) identity)
-        sharded? (and (= :sharded (:mode opts)) (= :append (:workload opts)))]
+        sharded? (and (= :sharded (:mode opts)) (#{:append :bank} (:workload opts)))]
     (merge tests/noop-test
            opts
            {:name      (test-name opts)
@@ -180,7 +213,7 @@
             :db        db
             :client    (role/restrict-client :pgdog (:client workload))
             :nemesis   (n/compose [(:nemesis pkg) (pn/pool-stats-nemesis)
-                                   (pn/shard-dump-nemesis)])
+                                   (pn/shard-dump-nemesis) (two-pc/nemesis)])
             :checker   (checker/compose
                          {:perf       (checker/perf {:nemeses (:perf pkg)})
                           :stats      (checker/stats)
@@ -201,10 +234,17 @@
                            (gen/nemesis (:final-generator pkg))
                            (gen/log "Waiting for recovery")
                            (gen/sleep (:recovery-time opts))
+                           ;; PgDog finishes in-doubt 2PC txns in the
+                           ;; background; give it --two-pc-deadline s.
+                           (if sharded?
+                             (gen/phases (gen/log "Waiting for 2PC recovery")
+                                         (gen/nemesis {:type :info, :f :await-2pc, :value nil}))
+                             [])
                            (gen/clients (:final-generator workload))
                            (if sharded?
                              (gen/phases (gen/log "Reading every shard directly")
-                                         (gen/nemesis {:type :info, :f :shard-dump, :value nil}))
+                                         (gen/nemesis {:type :info, :f :shard-dump, :value nil})
+                                         (gen/nemesis {:type :info, :f :prepared-xacts, :value nil}))
                              [])
                            (gen/log "Checking that pools drained")
                            (gen/nemesis {:type :info, :f :pool-stats, :value nil})))})))
@@ -313,6 +353,69 @@
    [nil "--two-pc" "Enable two_phase_commit"
     :default false]
 
+   [nil "--cross-shard" (str "sharded append: one key space spread over every shard (key j on shard j mod n), "
+                             "so most txns span shards (M3). Checks Elle at read-committed on the whole history, "
+                             "each shard's projection at the per-shard model, final-state atomicity and orphaned "
+                             "prepared txns")
+    :default false]
+
+   [nil "--inject-errors FRAC" (str "--cross-shard: fraction of multi-shard txns that hit an error on one of their "
+                                    "shards (division by zero) and then send COMMIT anyway (C12)")
+    :default 0
+    :parse-fn parse-double]
+
+   [nil "--accounts N" "bank: number of accounts (spread round-robin over the shards)"
+    :default 8
+    :parse-fn parse-long]
+
+   [nil "--total-amount N" "bank: total money, split evenly over the accounts"
+    :default 800
+    :parse-fn parse-long]
+
+   [nil "--max-transfer N" "bank: largest transfer"
+    :default 5
+    :parse-fn parse-long]
+
+   [nil "--auto-frac FRAC" "bank: fraction of cross-shard transfers done as one autocommit UPDATE (two_phase_commit_auto)"
+    :default 0
+    :parse-fn parse-double]
+
+   [nil "--cross-frac FRAC" "bank: fraction of transfers between accounts on different shards"
+    :default 0.8
+    :parse-fn parse-double]
+
+   [nil "--inject-error-kind KIND" (str "--inject-errors: server (Postgres rejects a statement on one shard), "
+                                        "syntax (a syntax error, which PgDog's parser answers itself), or mixed")
+    :default :server
+    :parse-fn keyword
+    :validate [#{:server :syntax :mixed} "must be server, syntax or mixed"]]
+
+   [nil "--wal-mode MODE" (str "PgDog 2PC WAL across PgDog restarts: keep, wipe (empty WAL dir on every restart, H2), "
+                               "or lazyfs (WAL dir on LazyFS; a kill also loses unfsynced writes, H3)")
+    :default :keep
+    :parse-fn keyword
+    :validate [#{:keep :wipe :lazyfs} "must be keep, wipe or lazyfs"]]
+
+   [nil "--wal-fsync-interval MS" "two_phase_commit_wal_fsync_interval (PgDog default 0: fsync on every write)"
+    :parse-fn parse-long]
+
+   [nil "--drain-timeout SECONDS" "How long the final pool check waits for every PgDog pool to drain"
+    :default 15
+    :parse-fn parse-long]
+   [nil "--two-pc-deadline SECONDS" "After healing, how long to wait for PgDog to resolve prepared txns"
+    :default 60
+    :parse-fn parse-long]
+
+   [nil "--lock-timeout MS" (str "Postgres lock_timeout. Cross-shard txns can deadlock across shards, which no "
+                                 "Postgres detects; 0 waits forever (until the client's socket timeout)")
+    :default 0
+    :parse-fn parse-long]
+
+   [nil "--shard-consistency-models LIST" "--cross-shard: Elle models for each shard's projection (default: serializable / snapshot-isolation / read-committed by isolation level)"
+    :parse-fn parse-faults
+    :validate [#(try (cm/anomalies-prohibited-by %) true (catch Exception _ false))
+               "unknown Elle consistency model"]]
+
    [nil "--two-pc-auto BOOL" "Set two_phase_commit_auto explicitly"
     :parse-fn parse-boolean]
 
@@ -367,11 +470,38 @@
 (defn test-fn
   "Fills in defaults the stock Jepsen CLI doesn't know about."
   [opts]
+  (when (and (:cross-shard opts) (not= :sharded (:mode opts)))
+    (throw (IllegalArgumentException. "--cross-shard needs --mode sharded")))
+  (when (and (:control opts) (= :sharded (:mode opts))
+             (or (:cross-shard opts) (= :bank (:workload opts))))
+    (throw (IllegalArgumentException.
+             "--control can't run cross-shard txns: it connects to one shard per txn")))
   (-> opts
       (update :isolation-mode #(or % (default-isolation-mode opts)))
       (update-in [:ssh :private-key-path]
                  #(or % (str (System/getProperty "user.home") "/.ssh/id_jepsen")))
       pgdog-test))
+
+(defn recheck-workload-cmd!
+  "Re-runs a stored test's whole workload checker (as the current code builds
+  it from the test's options) on its history, and writes the result to
+  results-recheck.edn in the store dir. Elle output is rewritten in place.
+  For fixing checkers without re-running tests."
+  [{:keys [arguments]}]
+  (doseq [dir arguments]
+    (let [r (try
+              (let [test (store/test (str dir))
+                    wl   ((workloads (:workload test)) test)
+                    r    (checker/check (:checker wl) test (:history test) {})]
+                (spit (str dir "/results-recheck.edn") (with-out-str (clojure.pprint/pprint r)))
+                r)
+              (catch Exception e {:valid? :error, :error (.getMessage e)}))]
+      (println (str/join "\t" (cons (pr-str (:valid? r))
+                                     (concat (for [[k v] (sort-by key (dissoc r :valid?))
+                                                   :when (map? v)]
+                                               (str (name k) "=" (pr-str (:valid? v))))
+                                             [dir]))))
+      (flush))))
 
 (defn -main
   [& args]
@@ -386,6 +516,9 @@
                                            :parse-fn parse-long]]
                                :usage    "Usage: lein run recheck [--consistency-models LIST] [--cycle-search-timeout MS] STORE_DIR..."
                                :run      recheck/run-cmd!}
+                    "recheck-workload" {:opt-spec []
+                                        :usage    "Usage: lein run recheck-workload STORE_DIR... (re-runs the whole workload checker)"
+                                        :run      recheck-workload-cmd!}
                     "reanalyze" {:opt-spec []
                                  :usage    "Usage: lein run reanalyze STORE_DIR... (re-runs the backends/isolation/lost/placement checkers)"
                                  :run      recheck/reanalyze-cmd!}})

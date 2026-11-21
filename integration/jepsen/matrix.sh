@@ -19,7 +19,7 @@ shift
 cd "$SCRIPT_DIR"
 mkdir -p store
 summary="store/matrix-$(date +%Y%m%dT%H%M%S).tsv"
-printf 'exit\tvalid\tok\tfail\tinfo\tanomalies\twrong\tfirst-wrong-s\tbackends\tpools\tplacement\txacts/txn\tstore\targs\n' | tee "$summary"
+printf 'exit\tvalid\tok\tfail\tinfo\tanomalies\twrong\tfirst-wrong-s\tbackends\tpools\tplacement\txacts/txn\tatomic\tpartial\tfail-vis\tok-lost\torphans\tbank\tstore\targs\n' | tee "$summary"
 
 # Pulls a count out of results.edn. The first match is in the top-level
 # :stats map, which comes before any workload checker output.
@@ -53,9 +53,17 @@ while IFS= read -r line; do
         pools=$(subvalid pools "$results")
         placement=$(subvalid placement "$results")
         xpt=$(token xacts-per-txn "$results")
+        atomic=$(subvalid atomicity "$results")
+        partial=$(token partial-count "$results")
+        failvis=$(token fail-visible-count "$results")
+        oklost=$(token ok-lost-count "$results")
+        orphans=$(token orphan-count "$results")
+        bank=$(subvalid bank "$results")
     else
         valid=missing ok=- fail=- info=- anom=- wrong=- first=- backends=- pools=- placement=- xpt=-
+        atomic=- partial=- failvis=- oklost=- orphans=- bank=-
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$valid" "$ok" "$fail" "$info" \
-        "$anom" "$wrong" "$first" "$backends" "$pools" "$placement" "$xpt" "${run#"$SCRIPT_DIR"/}" "$line" | tee -a "$summary"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$status" "$valid" "$ok" "$fail" "$info" \
+        "$anom" "$wrong" "$first" "$backends" "$pools" "$placement" "$xpt" "$atomic" "$partial" "$failvis" "$oklost" "$orphans" "$bank" \
+        "${run#"$SCRIPT_DIR"/}" "$line" | tee -a "$summary"
 done <"$matrix"
